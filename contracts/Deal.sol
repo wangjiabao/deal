@@ -9,7 +9,9 @@ import {Initializable}     from "@openzeppelin/contracts/proxy/utils/Initializab
 import {ReentrancyGuard}   from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
 /* ---------- 外部依赖接口（最小化） ---------- */
-interface IDL is IERC20 { function mint(address to, uint256 amount) external; function burn(uint256 amount) external; }
+// Deal 不再直接 mint DL；由 Factory 代理增发
+interface IFactoryMinter { function mintDL(address to, uint256 amount) external; }
+
 interface IWNATIVE is IERC20 { function deposit() external payable; function withdraw(uint256) external; }
 interface IDealInfoNFT {
     function partnersOf(uint256 tokenId) external view returns (uint256[] memory);
@@ -35,7 +37,7 @@ interface IFactoryIndex {
 }
 
 /* ==========================================================
- * Deal — 统一状态事件 + 消息事件去 text + Factory 热索引（按需调用）
+ * Deal
  * ========================================================== */
 contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
     using SafeERC20 for IERC20;
@@ -122,12 +124,12 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
     address public aPair;
     address public bPair;
 
-    uint16  public fee9PermilleNonDL;
-    uint16  public burn1PermilleDL;
+    // 手续费与奖励（permille）
+    uint16  public feePermilleNonDL;        // 默认 5（Factory 下发）
+    uint16  public rewardPermillePerSide;   // 默认 3（Factory 下发）
 
-    uint16  public rewardAPermillePerSide;
-    uint16  public rewardBPermillePerSide;
-    uint16  public rewardCPermillePerSide;
+    // 免手续费代币（与 DL 一样免收一切费用）
+    address public specialNoFeeToken;
 
     /* ------------ 跟踪开关（按需调用 Factory） ------------ */
     bool private _trackA;        // 创建者是否选择“跟踪”
@@ -156,10 +158,11 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
     event ANFTReturned(address indexed nft, uint256 indexed tokenId);
     event BNFTReturned(address indexed nft, uint256 indexed tokenId);
 
-    event FeesProcessed(address indexed tokenA, uint256 aFee9, uint256 aBurn1, address indexed tokenB, uint256 bFee9, uint256 bBurn1);
+    // 简化后的手续费事件
+    event FeesProcessed(address indexed tokenA, uint256 aFee, address indexed tokenB, uint256 bFee);
     event RewardsMinted(address indexed a, uint256 toA, address indexed b, uint256 toB, address indexed cAddr, uint256 toC);
 
-    // 消息事件：不包含 text，text 仅存储供分页读取
+    // 消息事件
     event MessagePosted(uint256 indexed index, address indexed from, uint64 ts);
     address[] public msgFrom; uint64[] public msgTime; string[] public msgText;
 
@@ -180,10 +183,11 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
         string  title;        uint64  timeoutSeconds; string memo;
     }
     struct ConfigParams {
-        address dl;           address infoNft;  address treasury; address WNATIVE;
-        address aTokenNorm;   address bTokenNorm; address aPair;   address bPair;
-        uint16  fee9PermilleNonDL; uint16 burn1PermilleDL;
-        uint16  rewardAPermillePerSide; uint16 rewardBPermillePerSide; uint16 rewardCPermillePerSide;
+        address dl;           address infoNft;     address treasury; address WNATIVE;
+        address aTokenNorm;   address bTokenNorm;  address aPair;    address bPair;
+        uint16  feePermilleNonDL;
+        uint16  rewardPermillePerSide;
+        address specialNoFeeToken;
         bool    trackCreator; // 创建者是否纳入 Factory “热索引”
     }
 
@@ -199,10 +203,11 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
 
         dl       = c.dl;      infoNft  = c.infoNft;  treasury = c.treasury;  WNATIVE  = c.WNATIVE;
         aTokenNorm = c.aTokenNorm; bTokenNorm = c.bTokenNorm; aPair = c.aPair; bPair = c.bPair;
-        fee9PermilleNonDL = c.fee9PermilleNonDL;   burn1PermilleDL = c.burn1PermilleDL;
-        rewardAPermillePerSide = c.rewardAPermillePerSide;
-        rewardBPermillePerSide = c.rewardBPermillePerSide;
-        rewardCPermillePerSide = c.rewardCPermillePerSide;
+
+        // 新参数装载
+        feePermilleNonDL      = c.feePermilleNonDL;       // 默认 5（来自 Factory）
+        rewardPermillePerSide = c.rewardPermillePerSide;  // 默认 3
+        specialNoFeeToken     = c.specialNoFeeToken;
 
         aSwapToken = p.aSwapToken;     aSwapAmount = p.aSwapAmount;
         aMarginToken = p.aMarginToken; aMarginAmount = p.aMarginAmount;
@@ -422,15 +427,15 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
 
     /* ========== 完成 / 取消 / 提取 ========== */
 
-    struct Fees { uint256 aFee9; uint256 aBurn1; uint256 bFee9; uint256 bBurn1; }
+    struct Fees { uint256 aFee; uint256 bFee; }
     struct Rewards { uint256 toA; uint256 toB; uint256 toC; address cAddr; uint256 cToken; }
 
     function _complete(CompletionReason reason) internal {
         Fees memory f = _computeFees();
         _processFees(f);
-        emit FeesProcessed(aSwapToken, f.aFee9, f.aBurn1, bSwapToken, f.bFee9, f.bBurn1);
+        emit FeesProcessed(aSwapToken, f.aFee, bSwapToken, f.bFee);
 
-        Rewards memory r = _computeRewardsAndChooseC();
+        Rewards memory r = _computeRewardsAndMaybeChooseC();
         _mintAndRecord(r);
 
         _setStatus(Status.Completed);
@@ -499,67 +504,79 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
 
     /* ========== 费用计算 & 执行（同时计算净额） ========== */
 
+    function _isNoFeeToken(address token) internal view returns (bool) {
+        address tNorm = (token == NATIVE) ? WNATIVE : token;
+        if (tNorm == dl) return true; // DL 永远免收费
+        if (specialNoFeeToken != address(0) && tNorm == specialNoFeeToken) return true;
+        return false;
+    }
+
     function _computeFees() internal returns (Fees memory f) {
-        f.aFee9  = (aSwapToken == dl) ? 0 : (aSwapAmount * fee9PermilleNonDL) / 1000;
-        f.aBurn1 = (aSwapToken == dl) ?     (aSwapAmount * burn1PermilleDL)   / 1000 : 0;
-        f.bFee9  = (bSwapToken == dl) ? 0 : (bSwapAmount * fee9PermilleNonDL) / 1000;
-        f.bBurn1 = (bSwapToken == dl) ?     (bSwapAmount * burn1PermilleDL)   / 1000 : 0;
-        aSwapNetForB = aSwapAmount - f.aFee9 - f.aBurn1;
-        bSwapNetForA = bSwapAmount - f.bFee9 - f.bBurn1;
+        // A 侧
+        if (_isNoFeeToken(aSwapToken)) { f.aFee = 0; }
+        else { f.aFee = (aSwapAmount * feePermilleNonDL) / 1000; }
+        // B 侧
+        if (_isNoFeeToken(bSwapToken)) { f.bFee = 0; }
+        else { f.bFee = (bSwapAmount * feePermilleNonDL) / 1000; }
+
+        aSwapNetForB = aSwapAmount - f.aFee;
+        bSwapNetForA = bSwapAmount - f.bFee;
     }
 
     function _processFees(Fees memory f) internal {
-        _handleOneSideFees(aSwapToken, aTokenNorm, aPair, f.aFee9, f.aBurn1);
-        _handleOneSideFees(bSwapToken, bTokenNorm, bPair, f.bFee9, f.bBurn1);
+        _handleOneSideFees(aSwapToken, aTokenNorm, aPair, f.aFee);
+        _handleOneSideFees(bSwapToken, bTokenNorm, bPair, f.bFee);
     }
 
-    function _handleOneSideFees(address token, address tokenNorm, address pair, uint256 fee9, uint256 burn1) internal {
-        if (burn1 > 0 && token == dl) {
-            bool burned = true;
-            try IDL(dl).burn(burn1) {} catch { burned = false; }
-            if (!burned) { IERC20(dl).safeTransfer(treasury, burn1); }
-        }
-        if (fee9 == 0 || token == dl) return;
+    function _handleOneSideFees(address token, address tokenNorm, address pair, uint256 fee) internal {
+        if (fee == 0) return;
 
         if (pair != address(0)) {
-            if (token == NATIVE) { IWNATIVE(WNATIVE).deposit{value: fee9}(); IERC20(WNATIVE).safeTransfer(pair, fee9); }
-            else { IERC20(tokenNorm).safeTransfer(pair, fee9); }
+            if (token == NATIVE) { IWNATIVE(WNATIVE).deposit{value: fee}(); IERC20(WNATIVE).safeTransfer(pair, fee); }
+            else { IERC20(tokenNorm).safeTransfer(pair, fee); }
             try IDealPairLike(pair).mintOtherOnly() returns (uint amountOther) { amountOther; } catch {
-                if (token == NATIVE) { IERC20(WNATIVE).safeTransfer(treasury, fee9); }
-                else { IERC20(tokenNorm).safeTransfer(treasury, fee9); }
+                if (token == NATIVE) { IERC20(WNATIVE).safeTransfer(treasury, fee); }
+                else { IERC20(tokenNorm).safeTransfer(treasury, fee); }
             }
         } else {
-            if (token == NATIVE) { (bool ok, ) = payable(treasury).call{value: fee9}(""); require(ok, "send fee9 eth fail"); }
-            else { IERC20(tokenNorm).safeTransfer(treasury, fee9); }
+            if (token == NATIVE) { (bool ok, ) = payable(treasury).call{value: fee}(""); require(ok, "send fee eth fail"); }
+            else { IERC20(tokenNorm).safeTransfer(treasury, fee); }
         }
     }
 
-    /* ========== 奖励计算（每侧 1 次报价 + 比例拆分） ========== */
+    /* ========== 奖励计算（总比例 3‰，按 2/3 人等分） ========== */
+    function _computeRewardsAndMaybeChooseC() internal returns (Rewards memory r) {
+        if (rewardPermillePerSide == 0) return r;
 
-    function _computeRewardsAndChooseC() internal returns (Rewards memory r) {
-        uint256 sumPermille = uint256(rewardAPermillePerSide) + uint256(rewardBPermillePerSide) + uint256(rewardCPermillePerSide);
-        if (sumPermille != 0) {
-            uint256 aBase = (aSwapAmount * sumPermille) / 1000;
-            uint256 aTotalDL = _quoteAggToDL(aSwapToken, aPair, aBase);
-            if (aTotalDL > 0) {
-                uint256 aToA = (aTotalDL * rewardAPermillePerSide) / sumPermille;
-                uint256 aToB = (aTotalDL * rewardBPermillePerSide) / sumPermille;
-                uint256 aToC = aTotalDL - aToA - aToB;
-                r.toA += aToA; r.toB += aToB; r.toC += aToC;
-            }
-            uint256 bBase = (bSwapAmount * sumPermille) / 1000;
-            uint256 bTotalDL = _quoteAggToDL(bSwapToken, bPair, bBase);
-            if (bTotalDL > 0) {
-                uint256 bToA = (bTotalDL * rewardAPermillePerSide) / sumPermille;
-                uint256 bToB = (bTotalDL * rewardBPermillePerSide) / sumPermille;
-                uint256 bToC = bTotalDL - bToA - bToB;
-                r.toA += bToA; r.toB += bToB; r.toC += bToC;
-            }
+        // 先按单侧 3‰ 折算为 DL，再汇总后等分
+        uint256 aBase = (aSwapAmount * rewardPermillePerSide) / 1000;
+        uint256 bBase = (bSwapAmount * rewardPermillePerSide) / 1000;
+
+        uint256 aDL = _quoteAggToDL(aSwapToken, aPair, aBase);
+        uint256 bDL = _quoteAggToDL(bSwapToken, bPair, bBase);
+
+        uint256 total = aDL + bDL;
+        if (total == 0) return r;
+
+        bool bothStaked = (aNftStaked && bNftStaked);
+        bool canChooseC = bothStaked && (infoNft != address(0));
+
+        uint256 cToken; address cOwner;
+        if (canChooseC) {
+            (cToken, cOwner) = _chooseC(aNftId, bNftId);
+            if (cOwner == address(0)) { canChooseC = false; }
         }
-        if (r.toC > 0 && infoNft != address(0) && aNftStaked && bNftStaked) {
-            (uint256 cToken, address cOwner) = _chooseC(aNftId, bNftId);
-            r.cToken = cToken; r.cAddr = cOwner;
-        }
+
+        uint256 recipients = canChooseC ? 3 : 2;
+        uint256 share = total / recipients;
+        uint256 rem   = total - share * recipients;
+
+        r.toA = share;
+        r.toB = share;
+        if (canChooseC) { r.toC = share; r.cToken = cToken; r.cAddr = cOwner; }
+
+        // 余数给 A（避免精度丢失）
+        if (rem > 0) { r.toA += rem; }
     }
 
     function _quoteAggToDL(address token, address pair, uint256 amountIn) internal returns (uint256 dlOut) {
@@ -592,10 +609,10 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
     }
 
     function _mintAndRecord(Rewards memory r) internal {
-        // 增发（建议 DL.mint 由 DL 合约限制 factory.isDeal(msg.sender)）
-        if (r.toA > 0) { try IDL(dl).mint(a, r.toA) {} catch {} }
-        if (r.toB > 0) { try IDL(dl).mint(b, r.toB) {} catch {} }
-        if (r.toC > 0 && r.cAddr != address(0)) { try IDL(dl).mint(r.cAddr, r.toC) {} catch {} }
+        // 由 Factory 代理增发（Deal 无 mint 权限）
+        if (r.toA > 0) { try IFactoryMinter(factory).mintDL(a, r.toA) {} catch {} }
+        if (r.toB > 0) { try IFactoryMinter(factory).mintDL(b, r.toB) {} catch {} }
+        if (r.toC > 0 && r.cAddr != address(0)) { try IFactoryMinter(factory).mintDL(r.cAddr, r.toC) {} catch {} }
 
         emit RewardsMinted(a, r.toA, b, r.toB, r.cAddr, r.toC);
 

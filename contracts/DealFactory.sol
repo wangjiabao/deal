@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {Clones}  from "@openzeppelin/contracts/proxy/Clones.sol";
+import {Ownable}    from "@openzeppelin/contracts/access/Ownable.sol";
+import {Clones}     from "@openzeppelin/contracts/proxy/Clones.sol";
+import {IERC20}     from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20}  from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-/* ---------- Deal 接口（与当前 Deal.sol 对齐） ---------- */
+/* ---------- 最小 DL 接口 ---------- */
+interface IDLBurnFrom { function burnFrom(address account, uint256 amount) external; }
+interface IDLMint     { function mint(address to, uint256 amount) external; }
+
+/* ---------- Deal 接口（与 Deal.sol 对齐） ---------- */
 interface IDealV4 {
     struct InitParams {
         address aSwapToken;   uint256 aSwapAmount;
@@ -28,12 +34,10 @@ interface IDealV4 {
         address bTokenNorm;
         address aPair;
         address bPair;
-        uint16  fee9PermilleNonDL;
-        uint16  burn1PermilleDL;
-        uint16  rewardAPermillePerSide;
-        uint16  rewardBPermillePerSide;
-        uint16  rewardCPermillePerSide;
-        bool    trackCreator; // 创建者是否加入“热索引”
+        uint16  feePermilleNonDL;       // 默认 5
+        uint16  rewardPermillePerSide;  // 默认 3
+        address specialNoFeeToken;      // 与 DL 一样免收费
+        bool    trackCreator;           // 创建者是否加入“热索引”
     }
     function initialize(address _factory, address _initiator, InitParams calldata p, ConfigParams calldata c) external;
 }
@@ -54,12 +58,11 @@ interface IDealPairInit {
 }
 
 /* ==========================================================
- * DealFactory — 创建 Pair & Deal；TWAP；“热索引”（可选）
- *   - 历史检索用事件，不落链上历史数组；
- *   - 热索引仅跟踪“进行中/待提取”，结束并 claim 后清除；
+ * DealFactory
  * ========================================================== */
 contract DealFactory is Ownable {
     using Clones for address;
+    using SafeERC20 for IERC20;
 
     /* ---------- 实现地址 ---------- */
     address public dealImplementation;
@@ -78,12 +81,15 @@ contract DealFactory is Ownable {
     // 归一化 token(OTHER 或 WNATIVE) => pair(DL↔token)
     mapping(address => address) public pairForToken;
 
-    /* ---------- 默认 Deal 参数 ---------- */
-    uint16 public defaultFee9PermilleNonDL = 9;
-    uint16 public defaultBurn1PermilleDL   = 1;
-    uint16 public defaultRewardAPermillePerSide = 3;
-    uint16 public defaultRewardBPermillePerSide = 3;
-    uint16 public defaultRewardCPermillePerSide = 1;
+    /* ---------- 默认 Deal 参数（owner 可调） ---------- */
+    uint16 public defaultFeePermilleNonDL       = 5; // 5‰
+    uint16 public defaultRewardPermillePerSide  = 3; // 3‰
+    address public specialNoFeeToken = address(0);   // 免收费代币（与 DL 一样免）
+
+    /* ---------- 创建销毁（DL）规则 ---------- */
+    bool    public createBurnEnabled;            // 默认关闭
+    address public createBurnPricingToken;       // 计价代币（例如 USDT/USDC）
+    uint256 public createBurnAmountInToken;      // 以计价代币精度计（如 1u）
 
     /* ---------- TWAP（带最小窗口粘性） ---------- */
     struct Obs { uint256 p1Cumulative; uint32 timestamp; bool inited; uint256 lastAvgQ112; }
@@ -104,6 +110,15 @@ contract DealFactory is Ownable {
     event PairCreated(address indexed pair, address indexed otherToken, uint16 feeBps);
     event PairFeeUpdated(address indexed pair, uint16 newFee);
     event PairMapped(address indexed otherToken, address indexed pair);
+
+    // 新增管理事件（无 burn）
+    event FeesAndRewardsUpdated(uint16 nonDLFeePermille, uint16 rewardPermille);
+    event SpecialNoFeeTokenUpdated(address indexed token);
+    event CreateBurnRuleUpdated(bool enabled, address pricingToken, uint256 amountInToken);
+    event CreateBurnExecuted(address indexed creator, address indexed pair, address pricingToken, uint256 amountInToken, uint256 dlBurned);
+
+    // 代理增发事件
+    event DLMinted(address indexed to, uint256 amount, address indexed deal);
 
     /* ---------- “热索引”：用户 -> 进行中/待提取 deals ---------- */
     mapping(address => address[]) private _trackedDealsByUser;                 // user => deals[]
@@ -155,6 +170,28 @@ contract DealFactory is Ownable {
         emit MinWindowSet(sec_);
     }
 
+    // 新：手续费与奖励全局默认值（无 burn）
+    function setFeesAndRewards(uint16 nonDLFeePermille, uint16 rewardPermillePerSide) external onlyOwner {
+        require(nonDLFeePermille <= 1000 && rewardPermillePerSide <= 1000, "permille");
+        defaultFeePermilleNonDL      = nonDLFeePermille;      // 默认 5
+        defaultRewardPermillePerSide = rewardPermillePerSide; // 默认 3
+        emit FeesAndRewardsUpdated(nonDLFeePermille, rewardPermillePerSide);
+    }
+
+    // 新：设置免手续费代币
+    function setSpecialNoFeeToken(address token) external onlyOwner {
+        specialNoFeeToken = token;
+        emit SpecialNoFeeTokenUpdated(token);
+    }
+
+    // 新：创建销毁规则
+    function setCreateBurnRule(bool enabled, address pricingToken, uint256 amountInToken) external onlyOwner {
+        createBurnEnabled       = enabled;
+        createBurnPricingToken  = pricingToken;
+        createBurnAmountInToken = amountInToken;
+        emit CreateBurnRuleUpdated(enabled, pricingToken, amountInToken);
+    }
+
     /* ========== Pair：创建 / 初始化 / 改费率 ========== */
     function createPair(address tokenOther, uint16 feeBps) external onlyOwner returns (address pair) {
         require(pairImplementation != address(0) && dlToken != address(0), "cfg");
@@ -187,9 +224,34 @@ contract DealFactory is Ownable {
 
     /* ========== TWAP：供 Deal 调用报价 ========== */
     function updateAndQuoteToDL(address pair, uint256 amountIn) external returns (uint256 dlOut) {
-        if (amountIn == 0 || pair == address(0)) return 0;
         require(isDeal[msg.sender], "NOT_DEAL");
+        _assertDlPair(pair);
+        return _updateAndQuoteInternal(pair, amountIn);
+    }
+
+    function _assertDlPair(address pair) internal view {
+        require(pair != address(0), "PAIR=0");
         require(IDealPairLight(pair).token0() == dlToken, "NOT_DL_PAIR");
+    }
+
+    function _currentP1CumulativeWithSpot(address pair)
+        internal view returns (uint256 p1CumNow, uint32 nowTs, uint256 spotQ112)
+    {
+        (, p1CumNow, ) = IDealPairLight(pair).getPriceCumulatives();
+        (uint112 r0, uint112 r1, uint32 tsRes) = IDealPairLight(pair).getReserves();
+        require(r0 > 0 && r1 > 0, "NO_LIQ");
+
+        nowTs = uint32(block.timestamp);
+        uint32 elapsed = nowTs - tsRes;
+        // 现货价（Q112）
+        spotQ112 = (uint256(uint224(r0)) << 112) / uint256(uint224(r1));
+        if (elapsed > 0) {
+            unchecked { p1CumNow += spotQ112 * elapsed; }
+        }
+    }
+
+    function _updateAndQuoteInternal(address pair, uint256 amountIn) internal returns (uint256 dlOut) {
+        if (amountIn == 0 || pair == address(0)) return 0;
 
         (uint256 cumNow, uint32 nowTs, uint256 spotQ112) = _currentP1CumulativeWithSpot(pair);
         Obs storage o = obsByPair[pair];
@@ -217,23 +279,7 @@ contract DealFactory is Ownable {
         dlOut = (avgQ112 * amountIn) >> 112;
     }
 
-    function _currentP1CumulativeWithSpot(address pair)
-        internal view returns (uint256 p1CumNow, uint32 nowTs, uint256 spotQ112)
-    {
-        (, p1CumNow, ) = IDealPairLight(pair).getPriceCumulatives();
-        (uint112 r0, uint112 r1, uint32 tsRes) = IDealPairLight(pair).getReserves();
-        require(r0 > 0 && r1 > 0, "NO_LIQ");
-
-        nowTs = uint32(block.timestamp);
-        uint32 elapsed = nowTs - tsRes;
-        // 现货价（Q112）
-        spotQ112 = (uint256(uint224(r0)) << 112) / uint256(uint224(r1));
-        if (elapsed > 0) {
-            unchecked { p1CumNow += spotQ112 * elapsed; }
-        }
-    }
-
-    /* ========== 创建 Deal（事件化 + isDeal 标记） ========== */
+    /* ========== 创建 Deal（事件化 + isDeal 标记 + 可选销毁 DL） ========== */
     struct CreateParams {
         IDealV4.InitParams init;
         bool trackCreator; // 创建者是否加入热索引
@@ -243,6 +289,22 @@ contract DealFactory is Ownable {
         require(dealImplementation != address(0), "impl=0");
         require(p.init.timeoutSeconds >= minTimeoutSeconds, "timeout<min");
         require(dlToken != address(0) && wrappedNative != address(0), "globals");
+
+        // （可选）创建前销毁一定数量的 DL：按计价代币数量经 TWAP 折算
+        if (createBurnEnabled) {
+            require(createBurnPricingToken != address(0) && createBurnAmountInToken > 0, "burn rule cfg");
+            address pricingNorm = (createBurnPricingToken == address(0)) ? wrappedNative : createBurnPricingToken;
+            address pair = pairForToken[pricingNorm];
+            require(pair != address(0), "burn pair=0");
+            _assertDlPair(pair);
+
+            uint256 dlNeed = _updateAndQuoteInternal(pair, createBurnAmountInToken);
+            require(dlNeed > 0, "dlNeed=0");
+
+            // 直接从创建者地址烧（需 approve 给 DL 合约或采用角色许可）
+            IDLBurnFrom(dlToken).burnFrom(msg.sender, dlNeed);
+            emit CreateBurnExecuted(msg.sender, pair, pricingNorm, createBurnAmountInToken, dlNeed);
+        }
 
         deal = dealImplementation.clone();
         isDeal[deal] = true; // 提前标记，便于 Deal.initialize 内回调本工厂
@@ -262,11 +324,9 @@ contract DealFactory is Ownable {
                 bTokenNorm: bNorm,
                 aPair:    pairForToken[aNorm],
                 bPair:    pairForToken[bNorm],
-                fee9PermilleNonDL:      defaultFee9PermilleNonDL,
-                burn1PermilleDL:        defaultBurn1PermilleDL,
-                rewardAPermillePerSide: defaultRewardAPermillePerSide,
-                rewardBPermillePerSide: defaultRewardBPermillePerSide,
-                rewardCPermillePerSide: defaultRewardCPermillePerSide,
+                feePermilleNonDL:       defaultFeePermilleNonDL,      // 5‰
+                rewardPermillePerSide:  defaultRewardPermillePerSide,  // 3‰
+                specialNoFeeToken:      specialNoFeeToken,             // 与 DL 一样免收费
                 trackCreator:           p.trackCreator
             });
             IDealV4(deal).initialize(address(this), msg.sender, p.init, cfg);
@@ -276,11 +336,18 @@ contract DealFactory is Ownable {
         emit DealCreatedV2(msg.sender, p.init.aNft, p.init.aNftId, deal);
     }
 
+    /* ========== 代理增发：仅允许 Deal 调用 ========== */
+    modifier onlyDeal() { require(isDeal[msg.sender], "NOT_DEAL"); _; }
+
+    function mintDL(address to, uint256 amount) external onlyDeal {
+        require(to != address(0) && amount > 0, "bad mint");
+        IDLMint(dlToken).mint(to, amount);
+        emit DLMinted(to, amount, msg.sender);
+    }
+
     /* ==========================================================
      * “热索引”维护回调（仅 Deal 可调用）
      * ========================================================== */
-    modifier onlyDeal() { require(isDeal[msg.sender], "NOT_DEAL"); _; }
-
     // Deal.initialize：若 trackCreator=true，则把 A 纳入索引
     function onCreated(address creator, bool trackCreator) external onlyDeal {
         if (trackCreator) _addTracked(creator, msg.sender);
