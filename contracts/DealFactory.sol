@@ -16,13 +16,12 @@ interface IDealV5 {
         address aMarginToken; uint256 aMarginAmount;
         address bSwapToken;   uint256 bSwapAmount;
         address bMarginToken; uint256 bMarginAmount;
-        uint8   joinMode;
+        uint8   joinMode;     // 0 Open, 1 ExactAddress, 2 NftGated
         address expectedB;
         address gateNft;      uint256 gateNftId;
         address aNft;         uint256 aNftId;
         string  title;
         uint64  timeoutSeconds;
-        string  memo;
     }
     struct ConfigParams {
         address dl; address infoNft; address treasury; address WNATIVE;
@@ -31,11 +30,11 @@ interface IDealV5 {
         uint16  mintPermilleOnFees;
         address specialNoFeeToken;
         bool    trackCreator;
+        bool    notifyInvite; // 是否开启“创建时一次性邀请”
     }
     function initialize(address _factory, address _initiator, InitParams calldata p, ConfigParams calldata c) external;
 }
 
-/* ---------- Pair 轻接口 / 初始化 ---------- */
 interface IDealPairLight {
     function token0() external view returns (address);
     function token1() external view returns (address);
@@ -72,7 +71,7 @@ contract DealFactory is Ownable {
 
     /* ---------- 默认参数 ---------- */
     uint16 public defaultFeePermilleNonDL   = 5; // 5‰
-    uint16 public defaultMintPermilleOnFees = 1; // 基于手续费(折DL)的增发千1
+    uint16 public defaultMintPermilleOnFees = 1; // 手续费(折DL) * 千1
     address public specialNoFeeToken = address(0);
 
     /* ---------- 创建销毁规则（可选） ---------- */
@@ -108,6 +107,12 @@ contract DealFactory is Ownable {
     mapping(address => mapping(address => uint256)) private _trackedIndexByUser;
     event TrackedAdded(address indexed user, address indexed deal);
     event TrackedRemoved(address indexed user, address indexed deal);
+
+    /* ---------- 邀请通知（由 Deal 调用） ---------- */
+    mapping(address => address[]) private _invitesByUser;                 // 被邀请人 => deals
+    mapping(address => mapping(address => uint256)) private _inviteIndex; // 1-based idx
+    event InvitationAdded(address indexed invitee, address indexed deal);
+    event InvitationCleared(address indexed invitee, address indexed deal, string action);
 
     constructor(address _dealImpl, address _pairImpl, uint64 _minTimeoutSeconds) Ownable(msg.sender) {
         require(_dealImpl != address(0) && _pairImpl != address(0));
@@ -196,7 +201,7 @@ contract DealFactory is Ownable {
     }
 
     /* ========== 创建 Deal ========== */
-    struct CreateParams { IDealV5.InitParams init; bool trackCreator; }
+    struct CreateParams { IDealV5.InitParams init; bool trackCreator; bool notifyInvite; }
 
     function createDeal(CreateParams calldata p) external returns (address deal) {
         require(dealImplementation != address(0));
@@ -212,8 +217,7 @@ contract DealFactory is Ownable {
             emit CreateBurnExecuted(msg.sender, pair, pricingNorm, createBurnAmountInToken, dlNeed);
         }
 
-        deal = dealImplementation.clone();
-        isDeal[deal] = true;
+        deal = dealImplementation.clone(); require(deal != address(0)); isDeal[deal] = true;
 
         address aNorm = (p.init.aSwapToken == address(0)) ? wrappedNative : p.init.aSwapToken;
         address bNorm = (p.init.bSwapToken == address(0)) ? wrappedNative : p.init.bSwapToken;
@@ -222,7 +226,9 @@ contract DealFactory is Ownable {
             dl: dlToken, infoNft: infoNft, treasury: treasury, WNATIVE: wrappedNative,
             aTokenNorm: aNorm, bTokenNorm: bNorm, aPair: pairForToken[aNorm], bPair: pairForToken[bNorm],
             feePermilleNonDL: defaultFeePermilleNonDL, mintPermilleOnFees: defaultMintPermilleOnFees,
-            specialNoFeeToken: specialNoFeeToken, trackCreator: p.trackCreator
+            specialNoFeeToken: specialNoFeeToken,
+            trackCreator: p.trackCreator,
+            notifyInvite: p.notifyInvite
         });
         IDealV5(deal).initialize(address(this), msg.sender, p.init, cfg);
 
@@ -241,7 +247,7 @@ contract DealFactory is Ownable {
     function onAbandoned(address creator, address prevParticipant) external onlyDeal { if (creator != address(0)) _removeTracked(creator, msg.sender); if (prevParticipant != address(0)) _removeTracked(prevParticipant, msg.sender); }
     function onClosedFor(address user) external onlyDeal { if (user != address(0)) _removeTracked(user, msg.sender); }
 
-    /* ========== 热索引：只读 / 维护 ========== */
+    /* ========== 热索引只读 ========== */
     function trackedCount(address user) external view returns (uint256) { return _trackedDealsByUser[user].length; }
     function getTracked(address user, uint256 offset, uint256 limit) external view returns (address[] memory list) {
         address[] storage arr = _trackedDealsByUser[user]; uint256 len = arr.length;
@@ -265,5 +271,46 @@ contract DealFactory is Ownable {
         if (i != last) { address lastDeal = arr[last]; arr[i] = lastDeal; _trackedIndexByUser[user][lastDeal] = i + 1; }
         arr.pop(); delete _trackedIndexByUser[user][deal];
         emit TrackedRemoved(user, deal);
+    }
+
+    /* ========== 邀请只读 / 写操作 ========== */
+    function inviteCount(address user) external view returns (uint256) { return _invitesByUser[user].length; }
+    function getInvites(address user, uint256 offset, uint256 limit) external view returns (address[] memory list) {
+        address[] storage arr = _invitesByUser[user]; uint256 len = arr.length;
+        if (offset >= len) return new address[](0);
+        uint256 end = offset + limit; if (end > len) end = len; uint256 n = end - offset;
+        list = new address[](n); for (uint256 i = 0; i < n; ++i) list[i] = arr[offset + i];
+    }
+    function isInvited(address user, address deal) external view returns (bool) { return _inviteIndex[user][deal] != 0; }
+
+    // 仅 Deal：添加 / 清理（幂等）
+    function addInviteOnDeal(address invitee) external onlyDeal {
+        if (invitee == address(0)) return;
+        mapping(address => uint256) storage idx = _inviteIndex[invitee];
+        if (idx[msg.sender] != 0) return;
+        _invitesByUser[invitee].push(msg.sender);
+        idx[msg.sender] = _invitesByUser[invitee].length;
+        emit InvitationAdded(invitee, msg.sender);
+    }
+    function clearInviteOnDeal(address invitee) external onlyDeal {
+        mapping(address => uint256) storage idx = _inviteIndex[invitee];
+        uint256 pos = idx[msg.sender]; if (pos == 0) return;
+        address[] storage arr = _invitesByUser[invitee];
+        uint256 i = pos - 1; uint256 last = arr.length - 1;
+        if (i != last) { address lastDeal = arr[last]; arr[i] = lastDeal; _inviteIndex[invitee][lastDeal] = i + 1; }
+        arr.pop(); delete _inviteIndex[invitee][msg.sender];
+        emit InvitationCleared(invitee, msg.sender, "byDeal");
+    }
+
+    // 被邀请人主动拒绝
+    function rejectInvitation(address deal) external {
+        require(isDeal[deal], "invalid deal");
+        mapping(address => uint256) storage idx = _inviteIndex[msg.sender];
+        uint256 pos = idx[deal]; if (pos == 0) return;
+        address[] storage arr = _invitesByUser[msg.sender];
+        uint256 i = pos - 1; uint256 last = arr.length - 1;
+        if (i != last) { address lastDeal = arr[last]; arr[i] = lastDeal; _inviteIndex[msg.sender][lastDeal] = i + 1; }
+        arr.pop(); delete _inviteIndex[msg.sender][deal];
+        emit InvitationCleared(msg.sender, deal, "rejected");
     }
 }

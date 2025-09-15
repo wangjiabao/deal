@@ -8,7 +8,7 @@ import {SafeERC20}         from "@openzeppelin/contracts/token/ERC20/utils/SafeE
 import {Initializable}     from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 import {ReentrancyGuard}   from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
-/* ---------- 外部依赖接口（最小化） ---------- */
+/* ---------- 工厂侧接口（最小化） ---------- */
 interface IFactoryMinter { function mintDL(address to, uint256 amount) external; }
 interface IWNATIVE is IERC20 { function deposit() external payable; function withdraw(uint256) external; }
 interface IDealInfoNFT {
@@ -27,6 +27,10 @@ interface IFactoryIndex {
     function onAbandoned(address creator, address prevParticipant) external;
     function onClosedFor(address user) external;
 }
+interface IFactoryInvites {
+    function addInviteOnDeal(address invitee) external;
+    function clearInviteOnDeal(address invitee) external;
+}
 
 /* ========================================================== */
 contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
@@ -39,7 +43,7 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
     enum Vote { Unset, Accept, Reject }
     enum CompletionReason { BothAccepted, ForcedByA, ForcedByB }
 
-    /* ------------ 基本信息 ------------ */
+    /* 基本信息 */
     address public factory;
     string  public title;
     address public a;
@@ -77,7 +81,7 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
     uint256 public aSwapNetForB;
     uint256 public bSwapNetForA;
 
-    /* ------------ 固化配置 ------------ */
+    /* 固化配置 */
     address public dl;
     address public infoNft;
     address public treasury;
@@ -85,14 +89,17 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
     address public aTokenNorm; address public bTokenNorm;
     address public aPair;      address public bPair;
 
-    uint16  public feePermilleNonDL;     // 例：5‰
-    uint16  public mintPermilleOnFees;   // 例：1‰（对“已计提手续费(折DL)”再乘此系数）
+    uint16  public feePermilleNonDL;
+    uint16  public mintPermilleOnFees;
     address public specialNoFeeToken;
 
     bool private _trackA;
     bool private _trackBActive;
 
-    /* ------------ 事件（精简） ------------ */
+    /* 邀请：只记录是否开启（一次性） */
+    bool private _notifyInvite;
+
+    /* 事件（精简） */
     event Initialized(address indexed initiator, address indexed factory);
     event Joined(address indexed b, bool stakedNft);
     event Locked();
@@ -106,7 +113,6 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
     event FeesProcessed(address indexed tokenA, uint256 aFee, address indexed tokenB, uint256 bFee);
     event RewardsMinted(address indexed a, uint256 toA, address indexed b, uint256 toB, address indexed cAddr, uint256 toC);
 
-    /* ------------ 修饰符 ------------ */
     modifier onlyA()  { require(msg.sender == a); _; }
     modifier onlyAB() { require(msg.sender == a || msg.sender == b); _; }
     modifier inState(Status s) { require(status == s); _; }
@@ -120,7 +126,7 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
         uint8   joinMode;     address expectedB;
         address gateNft;      uint256 gateNftId;
         address aNft;         uint256 aNftId;
-        string  title;        uint64  timeoutSeconds; string memo; // memo 不再使用，仅占位
+        string  title;        uint64  timeoutSeconds;
     }
     struct ConfigParams {
         address dl;           address infoNft;     address treasury; address WNATIVE;
@@ -129,6 +135,7 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
         uint16  mintPermilleOnFees;
         address specialNoFeeToken;
         bool    trackCreator;
+        bool    notifyInvite; // 仅在 1/2 模式下按需发送一次邀请
     }
 
     function initialize(address _factory, address _initiator, InitParams calldata p, ConfigParams calldata c)
@@ -147,14 +154,11 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
         bSwapToken=p.bSwapToken; bSwapAmount=p.bSwapAmount; bMarginToken=p.bMarginToken; bMarginAmount=p.bMarginAmount;
 
         require(p.joinMode <= uint8(JoinMode.NftGated));
-        joinMode = JoinMode(p.joinMode);
+        joinMode  = JoinMode(p.joinMode);
         expectedB = p.expectedB;
 
         gateNft   = p.gateNft; gateNftId = p.gateNftId;
-        if (joinMode == JoinMode.NftGated) {
-            require(gateNft != address(0));
-            bNft = gateNft; bNftId = gateNftId;
-        }
+        if (joinMode == JoinMode.NftGated) { require(gateNft != address(0)); bNft = gateNft; bNftId = gateNftId; }
 
         aNft=p.aNft; aNftId=p.aNftId;
         title=p.title; timeoutSeconds=p.timeoutSeconds;
@@ -167,6 +171,19 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
 
         _trackA = c.trackCreator;
         if (_trackA) IFactoryIndex(factory).onCreated(a, true);
+
+        // 仅在 1/2 模式且配置为 true 时，发送一次邀请（Open 模式强制关闭）
+        _notifyInvite = c.notifyInvite && (joinMode != JoinMode.Open);
+        if (_notifyInvite) {
+            if (joinMode == JoinMode.ExactAddress) {
+                require(expectedB != address(0), "expectedB=0");
+                IFactoryInvites(factory).addInviteOnDeal(expectedB);
+            } else {
+                address curOwner = IERC721(gateNft).ownerOf(gateNftId);
+                require(curOwner != address(0), "nft owner=0");
+                IFactoryInvites(factory).addInviteOnDeal(curOwner);
+            }
+        }
 
         emit Initialized(a, factory);
     }
@@ -182,6 +199,15 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
     function abandonByA() external nonReentrant onlyA {
         require(status == Status.Ready || status == Status.Active);
         address prevB = b;
+
+        // 销毁路径：ExactAddress 可清 expectedB；NftGated 可能已转手，留给被邀请人自行 reject
+        if (_notifyInvite) {
+            if (joinMode == JoinMode.ExactAddress && expectedB != address(0)) {
+                IFactoryInvites(factory).clearInviteOnDeal(expectedB);
+            }
+            _notifyInvite = false;
+        }
+
         _refundAllToParties();
 
         if (_trackA && _trackBActive) IFactoryIndex(factory).onAbandoned(a, prevB);
@@ -196,7 +222,7 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
     function join(address optNft, uint256 optId, bool trackMe) external inState(Status.Ready) {
         require(b == address(0));
         if (joinMode == JoinMode.ExactAddress) {
-            require(msg.sender == expectedB);
+            require(msg.sender == expectedB, "not expectedB");
             b = msg.sender;
             if (optNft != address(0)) {
                 require(IERC721(optNft).ownerOf(optId) == msg.sender);
@@ -205,7 +231,8 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
                 require(bNftStaked);
             }
         } else if (joinMode == JoinMode.NftGated) {
-            require(IERC721(gateNft).ownerOf(gateNftId) == msg.sender);
+            // 谁持有谁能进
+            require(IERC721(gateNft).ownerOf(gateNftId) == msg.sender, "not nft owner");
             b = msg.sender;
             _pendingBNft=gateNft; _pendingBNftId=gateNftId;
             IERC721(gateNft).safeTransferFrom(msg.sender, address(this), gateNftId);
@@ -218,6 +245,12 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
                 IERC721(optNft).safeTransferFrom(msg.sender, address(this), optId);
                 require(bNftStaked);
             }
+        }
+
+        // 如果这个 joiner 曾被邀请，则清理；不是被邀请人也没关系（幂等空操作）
+        if (_notifyInvite) {
+            IFactoryInvites(factory).clearInviteOnDeal(msg.sender);
+            _notifyInvite = false;
         }
 
         _trackBActive = trackMe;
@@ -304,9 +337,8 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
         _processFees(f); emit FeesProcessed(aSwapToken, f.aFee, bSwapToken, f.bFee);
 
         Rewards memory r = _computeRewardsFromFees(f);
-        _mintAndRecord(r);
-
-        _refreshMaxPointers(); // 完成后再更新 max
+        _mintAndRecord(r);               // <== 补回
+        _refreshMaxPointers();           // <== 补回
 
         status = Status.Completed;
         emit Completed(reason);
@@ -375,10 +407,7 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
         if (pair != address(0)) {
             if (token == NATIVE) { IWNATIVE(WNATIVE).deposit{value: fee}(); IERC20(WNATIVE).safeTransfer(pair, fee); }
             else { IERC20(tokenNorm).safeTransfer(pair, fee); }
-            try IDealPairLike(pair).mintOtherOnly() returns (uint amountOther) { amountOther; } catch {
-                if (token == NATIVE) IERC20(WNATIVE).safeTransfer(treasury, fee);
-                else IERC20(tokenNorm).safeTransfer(treasury, fee);
-            }
+            IDealPairLike(pair).mintOtherOnly();
         } else {
             if (token == NATIVE) { (bool ok, ) = payable(treasury).call{value: fee}(""); require(ok); }
             else IERC20(tokenNorm).safeTransfer(treasury, fee);
@@ -389,12 +418,10 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
     function _computeRewardsFromFees(Fees memory f) internal returns (Rewards memory r) {
         if (mintPermilleOnFees == 0) return r;
 
-        // 双无 NFT：不增发
         bool hasA = (infoNft != address(0)) && aNftStaked;
         bool hasB = (infoNft != address(0)) && bNftStaked;
         if (!hasA && !hasB) return r;
 
-        // 手续费折 DL（单行相加减少局部变量）
         uint256 totalFeeDL =
             _quoteAggToDL(aSwapToken, aPair, f.aFee) +
             _quoteAggToDL(bSwapToken, bPair, f.bFee);
@@ -406,7 +433,6 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
         uint256 share = totalToMint / 3;
         r.toA = share; r.toB = share;
 
-        // 选 C（0 表示不给）
         uint256 cToken = _selectC(hasA, hasB);
         if (cToken != 0) {
             r.cToken = cToken;
@@ -414,7 +440,6 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
             r.toC    = share;
         }
 
-        // 余数给 A
         uint256 rem = totalToMint - share * 3;
         if (rem > 0) r.toA += rem;
     }
@@ -431,45 +456,39 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
             uint256 sMA = inf.totalMintedOf(maxA);
             uint256 sMB = inf.totalMintedOf(maxB);
 
-            (uint256 win4, bool unique4) = _uniqueMax4(aNftId, sA, bNftId, sB, maxA, sMA, maxB, sMB);
+            (uint256 win4, bool unique4) = _uniqueMax4(aNftId, sA, bNftId, sB, maxA, sMA, maxB, sMB); // <== 需要该工具函数
             if (unique4) return win4;
-            if (sA == sB && sA == sMA && sA == sMB) return aNftId; // 四个全等→给A
-            return 0; // 其他并列不给
+            if (sA == sB && sA == sMA && sA == sMB) return aNftId;
+            return 0;
         }
 
         if (hasA) {
             uint256 maxA = inf.maxPartnerOf(aNftId);
             uint256 sA   = inf.totalMintedOf(aNftId);
             uint256 sMA  = inf.totalMintedOf(maxA);
-            return _preferFirstMax2(aNftId, sA, maxA, sMA); // 相等回退自己
+            return (sMA > sA) ? maxA : aNftId;
         }
 
         if (hasB) {
             uint256 maxB = inf.maxPartnerOf(bNftId);
             uint256 sB   = inf.totalMintedOf(bNftId);
             uint256 sMB  = inf.totalMintedOf(maxB);
-            return _preferFirstMax2(bNftId, sB, maxB, sMB);
+            return (sMB > sB) ? maxB : bNftId;
         }
 
         return 0;
     }
 
-    function _quoteAggToDL(address token, address pair, uint256 amountIn) internal returns (uint256 dlOut) {
-        if (amountIn == 0) return 0;
-        if (token == dl) return amountIn;
-        if (pair == address(0)) return 0;
-        try IFactoryTwap(factory).updateAndQuoteToDL(pair, amountIn) returns (uint256 x) { return x; } catch { return 0; }
-    }
-
-    /* ---------- 选最大/并列策略 ---------- */
+    /* ---------- 小工具：最大选择 & 并列策略（补回） ---------- */
     function _preferFirstMax2(uint256 id1, uint256 s1, uint256 id2, uint256 s2) internal pure returns (uint256) {
-        if (s2 > s1) return id2;
-        return id1; // s1>=s2：并列优先第一个
+        if (s2 > s1) return id2; return id1;
     }
-    function _preferFirstMax3(uint256 id1, uint256 s1, uint256 id2, uint256 s2, uint256 id3, uint256 s3)
-        internal pure returns (uint256)
-    {
-        if (s1 >= s2 && s1 >= s3) return id1; // 并列回退到第一个
+    function _preferFirstMax3(
+        uint256 id1, uint256 s1,
+        uint256 id2, uint256 s2,
+        uint256 id3, uint256 s3
+    ) internal pure returns (uint256) {
+        if (s1 >= s2 && s1 >= s3) return id1;
         if (s2 >= s3) return id2;
         return id3;
     }
@@ -487,7 +506,7 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
         return (0, false);
     }
 
-    /* ---------- 铸币 & 统计 ---------- */
+    /* ---------- 铸币 & 统计（补回） ---------- */
     function _mintAndRecord(Rewards memory r) internal {
         if (r.toA > 0) IFactoryMinter(factory).mintDL(a, r.toA);
         if (r.toB > 0) IFactoryMinter(factory).mintDL(b, r.toB);
@@ -501,7 +520,7 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
         }
     }
 
-    /* ---------- 完成后更新 maxA / maxB（并列回退到自己） ---------- */
+    /* ---------- 完成后更新 maxA / maxB（补回） ---------- */
     function _refreshMaxPointers() internal {
         if (infoNft == address(0)) return;
         IDealInfoNFT inf = IDealInfoNFT(infoNft);
@@ -509,38 +528,40 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
 
         if (hasA) {
             uint256 curMaxA = inf.maxPartnerOf(aNftId);
-            if (hasB) {
-                uint256 win = _preferFirstMax3(
-                    aNftId, inf.totalMintedOf(aNftId),    // A放第一个：并列回退A
+            uint256 winA = hasB
+                ? _preferFirstMax3(
+                    aNftId, inf.totalMintedOf(aNftId),
                     bNftId, inf.totalMintedOf(bNftId),
                     curMaxA, inf.totalMintedOf(curMaxA)
-                );
-                if (win != curMaxA) inf.setMaxPartnerOf(aNftId, win);
-            } else {
-                uint256 win = _preferFirstMax2(
+                )
+                : _preferFirstMax2(
                     aNftId, inf.totalMintedOf(aNftId),
                     curMaxA, inf.totalMintedOf(curMaxA)
                 );
-                if (win != curMaxA) inf.setMaxPartnerOf(aNftId, win);
-            }
+            if (winA != curMaxA) inf.setMaxPartnerOf(aNftId, winA);
         }
         if (hasB) {
             uint256 curMaxB = inf.maxPartnerOf(bNftId);
-            if (hasA) {
-                uint256 win = _preferFirstMax3(
-                    bNftId, inf.totalMintedOf(bNftId),    // B放第一个：并列回退B
+            uint256 winB = hasA
+                ? _preferFirstMax3(
+                    bNftId, inf.totalMintedOf(bNftId),
                     aNftId, inf.totalMintedOf(aNftId),
                     curMaxB, inf.totalMintedOf(curMaxB)
-                );
-                if (win != curMaxB) inf.setMaxPartnerOf(bNftId, win);
-            } else {
-                uint256 win = _preferFirstMax2(
+                )
+                : _preferFirstMax2(
                     bNftId, inf.totalMintedOf(bNftId),
                     curMaxB, inf.totalMintedOf(curMaxB)
                 );
-                if (win != curMaxB) inf.setMaxPartnerOf(bNftId, win);
-            }
+            if (winB != curMaxB) inf.setMaxPartnerOf(bNftId, winB);
         }
+    }
+
+    /* ========== 折算 ========== */
+    function _quoteAggToDL(address token, address pair, uint256 amountIn) internal returns (uint256 dlOut) {
+        if (amountIn == 0) return 0;
+        if (token == dl) return amountIn;
+        if (pair == address(0)) return 0;
+        try IFactoryTwap(factory).updateAndQuoteToDL(pair, amountIn) returns (uint256 x) { return x; } catch { return 0; }
     }
 
     /* ========== 自动锁定判定 ========== */
@@ -580,7 +601,7 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
         if (msg.sender == aNft && tokenId == aNftId && from == a && !aNftStaked) {
             aNftStaked = true; emit ANFTStaked(msg.sender, tokenId);
             return IERC721Receiver.onERC721Received.selector;
-    }
+        }
         if (from == b && !bNftStaked) {
             if (joinMode == JoinMode.NftGated) {
                 require(msg.sender == gateNft && tokenId == gateNftId);
