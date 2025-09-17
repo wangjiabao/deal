@@ -9,7 +9,7 @@ import {SafeERC20}  from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.so
 interface IDLBurnFrom { function burnFrom(address account, uint256 amount) external; }
 interface IDLMint     { function mint(address to, uint256 amount) external; }
 
-/* ---------- 与 Deal.sol 对齐 ---------- */
+/* ---------- 与 Deal.sol 对齐（notifyInvite 移除） ---------- */
 interface IDealV5 {
     struct InitParams {
         address aSwapToken;   uint256 aSwapAmount;
@@ -30,7 +30,6 @@ interface IDealV5 {
         uint16  mintPermilleOnFees;
         address specialNoFeeToken;
         bool    trackCreator;
-        bool    notifyInvite; // 是否开启“创建时一次性邀请”
     }
     function initialize(address _factory, address _initiator, InitParams calldata p, ConfigParams calldata c) external;
 }
@@ -108,12 +107,6 @@ contract DealFactory is Ownable {
     event TrackedAdded(address indexed user, address indexed deal);
     event TrackedRemoved(address indexed user, address indexed deal);
 
-    /* ---------- 邀请通知（由 Deal 调用） ---------- */
-    mapping(address => address[]) private _invitesByUser;                 // 被邀请人 => deals
-    mapping(address => mapping(address => uint256)) private _inviteIndex; // 1-based idx
-    event InvitationAdded(address indexed invitee, address indexed deal);
-    event InvitationCleared(address indexed invitee, address indexed deal, string action);
-
     constructor(address _dealImpl, address _pairImpl, uint64 _minTimeoutSeconds) Ownable(msg.sender) {
         require(_dealImpl != address(0) && _pairImpl != address(0));
         require(_minTimeoutSeconds >= 3600);
@@ -153,6 +146,7 @@ contract DealFactory is Ownable {
 
     /* ========== Pair：创建 / 初始化 / 改费率 ========== */
     function createPair(address tokenOther, uint16 feeBps) external onlyOwner returns (address pair) {
+        require(pairForToken[tokenOther] == address(0), "PAIR_EXISTS");
         require(pairImplementation != address(0) && dlToken != address(0));
         require(tokenOther != address(0) && tokenOther != dlToken);
         require(feeBps <= 1000);
@@ -201,7 +195,7 @@ contract DealFactory is Ownable {
     }
 
     /* ========== 创建 Deal ========== */
-    struct CreateParams { IDealV5.InitParams init; bool trackCreator; bool notifyInvite; }
+    struct CreateParams { IDealV5.InitParams init; bool trackCreator; } // notifyInvite 移除
 
     function createDeal(CreateParams calldata p) external returns (address deal) {
         require(dealImplementation != address(0));
@@ -209,7 +203,6 @@ contract DealFactory is Ownable {
         require(dlToken != address(0) && wrappedNative != address(0));
 
         if (createBurnEnabled) {
-            require(createBurnPricingToken != address(0) && createBurnAmountInToken > 0);
             address pricingNorm = (createBurnPricingToken == address(0)) ? wrappedNative : createBurnPricingToken;
             address pair = pairForToken[pricingNorm]; require(pair != address(0)); _assertDlPair(pair);
             uint256 dlNeed = _updateAndQuoteInternal(pair, createBurnAmountInToken); require(dlNeed > 0);
@@ -227,8 +220,7 @@ contract DealFactory is Ownable {
             aTokenNorm: aNorm, bTokenNorm: bNorm, aPair: pairForToken[aNorm], bPair: pairForToken[bNorm],
             feePermilleNonDL: defaultFeePermilleNonDL, mintPermilleOnFees: defaultMintPermilleOnFees,
             specialNoFeeToken: specialNoFeeToken,
-            trackCreator: p.trackCreator,
-            notifyInvite: p.notifyInvite
+            trackCreator: p.trackCreator
         });
         IDealV5(deal).initialize(address(this), msg.sender, p.init, cfg);
 
@@ -271,46 +263,5 @@ contract DealFactory is Ownable {
         if (i != last) { address lastDeal = arr[last]; arr[i] = lastDeal; _trackedIndexByUser[user][lastDeal] = i + 1; }
         arr.pop(); delete _trackedIndexByUser[user][deal];
         emit TrackedRemoved(user, deal);
-    }
-
-    /* ========== 邀请只读 / 写操作 ========== */
-    function inviteCount(address user) external view returns (uint256) { return _invitesByUser[user].length; }
-    function getInvites(address user, uint256 offset, uint256 limit) external view returns (address[] memory list) {
-        address[] storage arr = _invitesByUser[user]; uint256 len = arr.length;
-        if (offset >= len) return new address[](0);
-        uint256 end = offset + limit; if (end > len) end = len; uint256 n = end - offset;
-        list = new address[](n); for (uint256 i = 0; i < n; ++i) list[i] = arr[offset + i];
-    }
-    function isInvited(address user, address deal) external view returns (bool) { return _inviteIndex[user][deal] != 0; }
-
-    // 仅 Deal：添加 / 清理（幂等）
-    function addInviteOnDeal(address invitee) external onlyDeal {
-        if (invitee == address(0)) return;
-        mapping(address => uint256) storage idx = _inviteIndex[invitee];
-        if (idx[msg.sender] != 0) return;
-        _invitesByUser[invitee].push(msg.sender);
-        idx[msg.sender] = _invitesByUser[invitee].length;
-        emit InvitationAdded(invitee, msg.sender);
-    }
-    function clearInviteOnDeal(address invitee) external onlyDeal {
-        mapping(address => uint256) storage idx = _inviteIndex[invitee];
-        uint256 pos = idx[msg.sender]; if (pos == 0) return;
-        address[] storage arr = _invitesByUser[invitee];
-        uint256 i = pos - 1; uint256 last = arr.length - 1;
-        if (i != last) { address lastDeal = arr[last]; arr[i] = lastDeal; _inviteIndex[invitee][lastDeal] = i + 1; }
-        arr.pop(); delete _inviteIndex[invitee][msg.sender];
-        emit InvitationCleared(invitee, msg.sender, "byDeal");
-    }
-
-    // 被邀请人主动拒绝
-    function rejectInvitation(address deal) external {
-        require(isDeal[deal], "invalid deal");
-        mapping(address => uint256) storage idx = _inviteIndex[msg.sender];
-        uint256 pos = idx[deal]; if (pos == 0) return;
-        address[] storage arr = _invitesByUser[msg.sender];
-        uint256 i = pos - 1; uint256 last = arr.length - 1;
-        if (i != last) { address lastDeal = arr[last]; arr[i] = lastDeal; _inviteIndex[msg.sender][lastDeal] = i + 1; }
-        arr.pop(); delete _inviteIndex[msg.sender][deal];
-        emit InvitationCleared(msg.sender, deal, "rejected");
     }
 }

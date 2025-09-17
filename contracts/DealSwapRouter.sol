@@ -90,7 +90,7 @@ contract DealRouter is ReentrancyGuard {
         IERC20(token).safeTransferFrom(from, pair, amount);
         unchecked { actual = _balanceOf(token, pair) - b; }
     }
-    function _pullToPairMin(address token, address pair, address from, uint256 minAmount, bytes32 err) internal {
+    function _pullToPairMin(address token, address pair, address from, uint256 minAmount, string memory err) internal {
         uint256 b = _balanceOf(token, pair);
         IERC20(token).safeTransferFrom(from, pair, minAmount);
         require(_balanceOf(token, pair) - b >= minAmount, string(abi.encodePacked(err)));

@@ -84,9 +84,21 @@ contract DealInfoNFT is ERC721, Ownable {
         return string(abi.encodePacked("data:image/svg+xml;base64,", Base64.encode(bytes(svg))));
     }
 
+    
+    mapping(uint256 => string) public username;
+    event TokenUserNameSet(uint256 indexed tokenId, string username);
+
+    function setTokenUserName(uint256 tokenId, string calldata _name) external onlyOwnerOrApproved(tokenId) {
+        require(_ownerOf(tokenId) != address(0));
+        username[tokenId] = _name; emit TokenUserNameSet(tokenId, _name);
+    }
+
     // 统计累计
     mapping(uint256 => uint256) public totalDLMinted;
     event MintedAdded(uint256 indexed tokenId, uint256 amount);
+    function totalMintedOf(uint256 tokenId) external view returns (uint256) {
+        return totalDLMinted[tokenId];
+    }
 
     // 单一“最大伙伴”指针（默认指向自己）
     mapping(uint256 => uint256) private _maxPartner;

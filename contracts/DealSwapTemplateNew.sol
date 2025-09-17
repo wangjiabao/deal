@@ -36,6 +36,8 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
     address public token0;  // DL
     address public token1;  // OTHER
 
+    uint256 public token1BalanceInit; // 系统初始化默认token1的余额
+
     /* ---------------- Reserves / TWAP ---------------- */
     uint112 private reserve0; // DL
     uint112 private reserve1; // OTHER
@@ -100,6 +102,9 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
     }
     function getPriceCumulatives() external view returns (uint256 p0Cum, uint256 p1Cum, uint32 ts) {
         return (price0CumulativeLast, price1CumulativeLast, blockTimestampLast);
+    }
+    function token1Balance() public view returns (uint256) {
+        return IERC20(token1).balanceOf(address(this)) + token1BalanceInit;
     }
 
     /* ---------------- Quotes (front-end helpers) ---------------- */
@@ -203,12 +208,14 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
     }
 
     /// 由 Factory 完成初始化（需先把 DL 与 OTHER 转入本合约）
-    function mintInitial() external nonReentrant onlyFactory returns (uint amountDL, uint amountOther) {
+    function mintInitial(uint256 _b1) external nonReentrant onlyFactory returns (uint amountDL, uint amountOther) {
         require(!liquidityInited, "ALREADY_INIT");
+
+        token1BalanceInit = _b1;
 
         (uint112 r0, uint112 r1,) = getReserves(); // 预期(0,0)，但用差值更稳
         uint256 b0 = IERC20(token0).balanceOf(address(this));
-        uint256 b1 = IERC20(token1).balanceOf(address(this));
+        uint256 b1 = token1Balance();
 
         amountDL    = b0 - r0;
         amountOther = b1 - r1;
@@ -236,7 +243,7 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
         }
 
         // 2) 仅按 OTHER 净流入增储
-        uint256 b1 = IERC20(token1).balanceOf(address(this));
+        uint256 b1 = token1Balance();
         uint256 in1 = b1 - r1;
         require(in1 > 0, "NO_OTHER_IN");
 
@@ -285,7 +292,7 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
 
             // 3) 反推输入（余额差）
             uint256 b0 = IERC20(token0).balanceOf(address(this));
-            uint256 b1 = IERC20(token1).balanceOf(address(this));
+            uint256 b1 = token1Balance();
             uint256 in0 = b0 > r0 - amount0OutGross ? b0 - (r0 - amount0OutGross) : 0; // DL in（通常为0）
             uint256 in1 = b1 > r1 ? b1 - r1 : 0;                                       // OTHER in
             require(in0 > 0 || in1 > 0, "INSUFFICIENT_INPUT");
@@ -306,7 +313,7 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
 
             // 2) 反推输入（余额差）
             uint256 b0 = IERC20(token0).balanceOf(address(this));
-            uint256 b1 = IERC20(token1).balanceOf(address(this));
+            uint256 b1 = token1Balance();
             uint256 in0 = b0 > r0 ? b0 - r0 : 0;                                       // DL in
             uint256 in1 = b1 > r1 - amount1OutGross ? b1 - (r1 - amount1OutGross) : 0; // OTHER in（通常为0）
             require(in0 > 0 || in1 > 0, "INSUFFICIENT_INPUT");
@@ -343,7 +350,7 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
     /* ---------------- internal ---------------- */
     function _updateReserves() internal {
         uint256 b0 = IERC20(token0).balanceOf(address(this));
-        uint256 b1 = IERC20(token1).balanceOf(address(this));
+        uint256 b1 = token1Balance();
         require(b0 <= type(uint112).max && b1 <= type(uint112).max, "OVERFLOW");
 
         uint32 ts = uint32(block.timestamp);

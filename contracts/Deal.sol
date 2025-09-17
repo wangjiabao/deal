@@ -27,10 +27,6 @@ interface IFactoryIndex {
     function onAbandoned(address creator, address prevParticipant) external;
     function onClosedFor(address user) external;
 }
-interface IFactoryInvites {
-    function addInviteOnDeal(address invitee) external;
-    function clearInviteOnDeal(address invitee) external;
-}
 
 /* ========================================================== */
 contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
@@ -96,9 +92,6 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
     bool private _trackA;
     bool private _trackBActive;
 
-    /* 邀请：只记录是否开启（一次性） */
-    bool private _notifyInvite;
-
     /* 事件（精简） */
     event Initialized(address indexed initiator, address indexed factory);
     event Joined(address indexed b, bool stakedNft);
@@ -135,7 +128,6 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
         uint16  mintPermilleOnFees;
         address specialNoFeeToken;
         bool    trackCreator;
-        bool    notifyInvite; // 仅在 1/2 模式下按需发送一次邀请
     }
 
     function initialize(address _factory, address _initiator, InitParams calldata p, ConfigParams calldata c)
@@ -172,19 +164,6 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
         _trackA = c.trackCreator;
         if (_trackA) IFactoryIndex(factory).onCreated(a, true);
 
-        // 仅在 1/2 模式且配置为 true 时，发送一次邀请（Open 模式强制关闭）
-        _notifyInvite = c.notifyInvite && (joinMode != JoinMode.Open);
-        if (_notifyInvite) {
-            if (joinMode == JoinMode.ExactAddress) {
-                require(expectedB != address(0), "expectedB=0");
-                IFactoryInvites(factory).addInviteOnDeal(expectedB);
-            } else {
-                address curOwner = IERC721(gateNft).ownerOf(gateNftId);
-                require(curOwner != address(0), "nft owner=0");
-                IFactoryInvites(factory).addInviteOnDeal(curOwner);
-            }
-        }
-
         emit Initialized(a, factory);
     }
 
@@ -199,14 +178,6 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
     function abandonByA() external nonReentrant onlyA {
         require(status == Status.Ready || status == Status.Active);
         address prevB = b;
-
-        // 销毁路径：ExactAddress 可清 expectedB；NftGated 可能已转手，留给被邀请人自行 reject
-        if (_notifyInvite) {
-            if (joinMode == JoinMode.ExactAddress && expectedB != address(0)) {
-                IFactoryInvites(factory).clearInviteOnDeal(expectedB);
-            }
-            _notifyInvite = false;
-        }
 
         _refundAllToParties();
 
@@ -245,12 +216,6 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
                 IERC721(optNft).safeTransferFrom(msg.sender, address(this), optId);
                 require(bNftStaked);
             }
-        }
-
-        // 如果这个 joiner 曾被邀请，则清理；不是被邀请人也没关系（幂等空操作）
-        if (_notifyInvite) {
-            IFactoryInvites(factory).clearInviteOnDeal(msg.sender);
-            _notifyInvite = false;
         }
 
         _trackBActive = trackMe;
@@ -456,7 +421,7 @@ contract Deal is Initializable, ReentrancyGuard, IERC721Receiver {
             uint256 sMA = inf.totalMintedOf(maxA);
             uint256 sMB = inf.totalMintedOf(maxB);
 
-            (uint256 win4, bool unique4) = _uniqueMax4(aNftId, sA, bNftId, sB, maxA, sMA, maxB, sMB); // <== 需要该工具函数
+            (uint256 win4, bool unique4) = _uniqueMax4(aNftId, sA, bNftId, sB, maxA, sMA, maxB, sMB);
             if (unique4) return win4;
             if (sA == sB && sA == sMA && sA == sMB) return aNftId;
             return 0;
