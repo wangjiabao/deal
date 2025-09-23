@@ -1,18 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-/*
-  DealSwapTemplate (Pair) — token0 is DL, token1 is OTHER
-  -------------------------------------------------------
-  - 初始化：一次性同时注入 DL 与 OTHER（两边必须 >0），仅 Factory 可调用。
-  - 初始化后：仅允许 Factory 创建的 Deal 调用 mintOtherOnly（单边添加 OTHER），禁止 DL 流入；
-             含自动/手动清灰（burn 储备之外的 DL）。
-  - 手续费只在 DL 侧（feeBps 由 Factory 设定/更新）：
-      · 卖 DL：对 DL 输入先扣费并燃烧，再按恒积计算 OTHER 输出；
-      · 买 DL：先给出 DL 净额（毛额-手续费），再燃烧手续费；K 用真实余额校验（=按毛额承担）。
-  - 无 LP Token；公开 swap；TWAP 采用 UQ112x112（price cumulatives）。
-*/
-
 /// ===== Minimal IERC20 =====
 import "./interfaces/IERC20.sol";
 
@@ -46,12 +34,13 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
     uint256 public price1CumulativeLast; // token0/token1
 
     /* ---------------- Params ---------------- */
-    // fee (DL-side, in bps) —— 由 Factory 管理
-    uint16  public feeBps;
+    // fee (DL-side, as num/den) —— 由 Factory 管理
+    uint32  public feeNum;
+    uint32  public feeDen;
     bool    public liquidityInited;
 
     /* ---------------- Events ---------------- */
-    event FeeChanged(uint16 oldFee, uint16 newFee);
+    event FeeChanged(uint32 oldNum, uint32 oldDen, uint32 newNum, uint32 newDen);
     event Sync(uint112 reserve0, uint112 reserve1);
     event MintInitial(uint256 amountDL, uint256 amountOther);
     event MintOtherOnly(uint256 amountOther);
@@ -81,17 +70,19 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
         address dlToken,
         address otherToken,
         address factory_,
-        uint16  feeBps_
+        uint32  feeNum_,
+        uint32  feeDen_
     ) external initializer {
         require(dlToken != address(0) && otherToken != address(0), "ZERO_ADDR");
         require(dlToken != otherToken, "IDENTICAL_ADDR");
         require(factory_ != address(0), "ZERO_FACTORY");
-        require(feeBps_ <= 1000, "FEE_TOO_HIGH"); // ≤10%
+        require(feeDen_ > 0 && feeNum_ < feeDen_, "BAD_FEE");
 
         token0  = dlToken;
         token1  = otherToken;
         factory = factory_;
-        feeBps  = feeBps_;
+        feeNum  = feeNum_;
+        feeDen  = feeDen_;
     }
 
     /* ---------------- Views ---------------- */
@@ -100,6 +91,11 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
     }
     function getPriceCumulatives() external view returns (uint256 p0Cum, uint256 p1Cum, uint32 ts) {
         return (price0CumulativeLast, price1CumulativeLast, blockTimestampLast);
+    }
+
+    /* ---------------- Internal math ---------------- */
+    function _ceilDiv(uint256 a, uint256 b) private pure returns (uint256) {
+        return (a + b - 1) / b;
     }
 
     /* ---------------- Quotes (front-end helpers) ---------------- */
@@ -114,9 +110,9 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
 
         // in1_min = ceil(r1 * gross / (r0 - gross))
         uint256 denom = uint256(r0) - amount0OutGross;
-        in1Min = (uint256(r1) * amount0OutGross + denom - 1) / denom;
+        in1Min = _ceilDiv(uint256(r1) * amount0OutGross, denom);
 
-        feeOut = (amount0OutGross * feeBps) / 10000; // floor
+        feeOut = (amount0OutGross * feeNum) / feeDen; // floor
         out0Net = amount0OutGross - feeOut;
     }
 
@@ -128,18 +124,18 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
         (uint112 r0, uint112 r1,) = getReserves();
         require(out0NetTarget > 0 && out0NetTarget < r0, "BAD_NET");
 
-        uint256 denom = 10000 - feeBps; // >0 因 feeBps<=1000
-        grossMin = (out0NetTarget * 10000 + denom - 1) / denom; // ceil
-        feeOut = (grossMin * feeBps) / 10000;
+        uint256 denom = uint256(feeDen) - feeNum; // >0
+        grossMin = _ceilDiv(out0NetTarget * feeDen, denom); // ceil
+        feeOut = (grossMin * feeNum) / feeDen;
         if (grossMin - feeOut < out0NetTarget) {
             unchecked { grossMin += 1; }
-            feeOut = (grossMin * feeBps) / 10000;
+            feeOut = (grossMin * feeNum) / feeDen;
         }
         require(grossMin < r0, "INSUFFICIENT_LIQ");
 
         // in1_min = ceil(r1 * grossMin / (r0 - grossMin))
         uint256 d = uint256(r0) - grossMin;
-        in1Min = (uint256(r1) * grossMin + d - 1) / d;
+        in1Min = _ceilDiv(uint256(r1) * grossMin, d);
     }
 
     function quoteBuyGivenIn1(uint256 amount1In)
@@ -154,7 +150,7 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
         require(grossMax < r0, "INSUFFICIENT_LIQ");
         require(grossMax > 0, "INSUFFICIENT_IN");
 
-        feeOut = (grossMax * feeBps) / 10000; // floor
+        feeOut = (grossMax * feeNum) / feeDen; // floor
         out0Net = grossMax - feeOut;
     }
 
@@ -166,7 +162,7 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
         (uint112 r0, uint112 r1,) = getReserves();
         require(amount0In > 0, "ZERO_IN");
 
-        feeIn = (amount0In * feeBps) / 10000;
+        feeIn = (amount0In * feeNum) / feeDen;
         uint256 in0Eff = amount0In - feeIn;
         out1 = (uint256(r1) * in0Eff) / (uint256(r0) + in0Eff); // floor
     }
@@ -181,25 +177,26 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
 
         // 有效输入（已扣费）下限：ceil(r0 * out1 / (r1 - out1))
         uint256 denom = uint256(r1) - out1Target;
-        in0EffMin = (uint256(r0) * out1Target + denom - 1) / denom;
+        in0EffMin = _ceilDiv(uint256(r0) * out1Target, denom);
 
         // 把有效输入还原成毛输入（考虑 fee 向下取整，做一次校正）
-        uint256 denom2 = 10000 - feeBps; // >0
-        in0Min = (in0EffMin * 10000 + denom2 - 1) / denom2; // ceil
-        feeIn  = (in0Min * feeBps) / 10000;
+        uint256 denom2 = uint256(feeDen) - feeNum; // >0
+        in0Min = _ceilDiv(in0EffMin * feeDen, denom2);
+        feeIn  = (in0Min * feeNum) / feeDen;
         if (in0Min - feeIn < in0EffMin) {
             unchecked { in0Min += 1; }
-            feeIn = (in0Min * feeBps) / 10000;
+            feeIn = (in0Min * feeNum) / feeDen;
         }
     }
 
     /* ---------------- Governance (Factory only) ---------------- */
 
     /// Factory 调整本 Pair 的手续费
-    function setFeeBps(uint16 newFee) external onlyFactory {
-        require(newFee <= 1000, "FEE_TOO_HIGH");
-        emit FeeChanged(feeBps, newFee);
-        feeBps = newFee;
+    function setFee(uint32 newNum, uint32 newDen) external onlyFactory {
+        require(newDen > 0 && newNum < newDen, "BAD_FEE");
+        emit FeeChanged(feeNum, feeDen, newNum, newDen);
+        feeNum = newNum;
+        feeDen = newDen;
     }
 
     /// 由 Factory 完成初始化（需先把 DL 与 OTHER 转入本合约）
@@ -220,8 +217,6 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
     }
 
     /* ---------------- Liquidity (Deal only) ---------------- */
-
-    /// 初始化后：仅 Factory 创建的 Deal 可单边添加 OTHER
     function mintOtherOnly() external nonReentrant returns (uint amountOther) {
         require(liquidityInited, "NOT_INIT");
 
@@ -274,7 +269,7 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
             }
 
             // 2) 计算输出净额与手续费，转出净额并燃烧手续费
-            uint256 dlOutFee = (amount0OutGross * feeBps) / 10000;
+            uint256 dlOutFee = (amount0OutGross * feeNum) / feeDen;
             uint256 out0Net  = amount0OutGross - dlOutFee;
 
             if (out0Net > 0) IERC20(token0).safeTransfer(to, out0Net);
@@ -312,7 +307,7 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
             require(in0 > 0 || in1 > 0, "INSUFFICIENT_INPUT");
 
             // 3) 对 DL 输入扣费并燃烧，再用净额参与 K 校验
-            uint256 feeIn = (in0 * feeBps) / 10000;
+            uint256 feeIn = (in0 * feeNum) / feeDen;
             if (feeIn > 0) {
                 IDLBurnable(token0).burn(feeIn);
                 emit FeeBurned(feeIn);

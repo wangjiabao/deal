@@ -29,7 +29,8 @@ contract DLToken is ERC20, ERC20Burnable, ERC20Permit, ERC20Pausable, AccessCont
         string memory name_,
         string memory symbol_,
         uint256 initialSupply,
-        address initialAdmin
+        address initialAdmin,
+        address minterFirst_
     )
         ERC20(name_, symbol_)
         ERC20Permit(name_) // EIP-2612 域名使用 token name
@@ -42,6 +43,8 @@ contract DLToken is ERC20, ERC20Burnable, ERC20Permit, ERC20Pausable, AccessCont
         if (initialSupply > 0) {
             _mint(admin, initialSupply);
         }
+
+        _grantRole(MINTER_ROLE, minterFirst_);
     }
 
     /// @notice 无限增发（仅 MINTER_ROLE）

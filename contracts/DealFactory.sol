@@ -5,12 +5,14 @@ import {Ownable}    from "@openzeppelin/contracts/access/Ownable.sol";
 import {Clones}     from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC20}     from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20}  from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC721}    from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 
+/* ---------------- Token interfaces ---------------- */
 interface IDLBurnFrom { function burnFrom(address account, uint256 amount) external; }
 interface IDLMint     { function mint(address to, uint256 amount) external; }
 
-/* ---------- 与 Deal.sol 对齐（notifyInvite 移除） ---------- */
-interface IDealV5 {
+/* ---------------- Deal initializer interface ---------------- */
+interface IDeal {
     struct InitParams {
         address aSwapToken;   uint256 aSwapAmount;
         address aMarginToken; uint256 aMarginAmount;
@@ -18,22 +20,29 @@ interface IDealV5 {
         address bMarginToken; uint256 bMarginAmount;
         uint8   joinMode;     // 0 Open, 1 ExactAddress, 2 NftGated
         address expectedB;
-        address gateNft;      uint256 gateNftId;
-        address aNft;         uint256 aNftId;
+        uint256 gateNftId;    // 门禁 NFT 的 tokenId（仅在 NftGated 模式使用）
+        uint256 aNftId;       // A 侧自愿/要求绑定的 tokenId（0 代表不需要）
         string  title;
         uint64  timeoutSeconds;
     }
     struct ConfigParams {
         address dl; address infoNft; address treasury; address WNATIVE;
         address aTokenNorm; address bTokenNorm; address aPair; address bPair;
-        uint16  feePermilleNonDL;
-        uint16  mintPermilleOnFees;
+        uint32  feeNonDLNum;      uint32 feeNonDLDen;
+        uint32  mintOnFeesNum;    uint32 mintOnFeesDen;
         address specialNoFeeToken;
         bool    trackCreator;
+
+        // 留言计费
+        bool    msgPriceEnabled;
+        address msgPriceTokenNorm;
+        address msgPricePair;
+        uint256 msgPriceAmountInToken;
     }
     function initialize(address _factory, address _initiator, InitParams calldata p, ConfigParams calldata c) external;
 }
 
+/* ---------------- Pair light & init interfaces ---------------- */
 interface IDealPairLight {
     function token0() external view returns (address);
     function token1() external view returns (address);
@@ -41,15 +50,36 @@ interface IDealPairLight {
     function getReserves() external view returns (uint112 r0, uint112 r1, uint32 ts);
 }
 interface IDealPairInit {
-    function initialize(address dlToken, address otherToken, address factory_, uint16 feeBps_) external;
-    function setFeeBps(uint16 newFee) external;
+    function initialize(address dlToken, address otherToken, address factory_, uint32 feeNum_, uint32 feeDen_) external;
+    function setFee(uint32 newNum, uint32 newDen) external;
     function mintInitial() external returns (uint amountDL, uint amountOther);
 }
 
+/* ---------------- DealInfoNFT (写操作由 Factory 代理) ---------------- */
+interface IDealInfoNFT {
+    function totalMintedOf(uint256 tokenId) external view returns (uint256);
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function addMinted(uint256 tokenId, uint256 amount) external;
+    function maxPartnerOf(uint256 tokenId) external view returns (uint256);
+    function setMaxPartnerOf(uint256 tokenId, uint256 partnerTokenId) external;
+}
+
+/* ========= 新增：InfoNFT 锁操作接口（Factory 调用） ========= */
+interface IDealInfoNFTLock {
+    function lockByFactory(uint256 tokenId, address deal, address owner) external;
+    function unlockByFactory(uint256 tokenId, address deal) external;
+}
 /* ========================================================== */
 contract DealFactory is Ownable {
     using Clones for address;
     using SafeERC20 for IERC20;
+
+    /* ---------- 数学工具 ---------- */
+    error RatioInvalid();
+    struct Ratio { uint32 num; uint32 den; }
+    function _assertRatio(Ratio memory r) internal pure {
+        if (r.den == 0 || r.num >= r.den) revert RatioInvalid();
+    }
 
     /* ---------- 实现地址 ---------- */
     address public dealImplementation;
@@ -61,7 +91,7 @@ contract DealFactory is Ownable {
 
     /* ---------- 全局依赖 ---------- */
     address public dlToken;
-    address public infoNft;
+    address public infoNft;     // 唯一 NFT
     address public treasury;
     address public wrappedNative;
 
@@ -69,20 +99,24 @@ contract DealFactory is Ownable {
     mapping(address => address) public pairForToken;
 
     /* ---------- 默认参数 ---------- */
-    uint16 public defaultFeePermilleNonDL   = 5; // 5‰
-    uint16 public defaultMintPermilleOnFees = 1; // 手续费(折DL) * 千1
-    address public specialNoFeeToken = address(0);
+    Ratio  public defaultFeeNonDL        = Ratio({num: 5, den: 1000}); // 5‰
+    Ratio  public defaultMintOnFees      = Ratio({num: 1, den: 1000}); // 千1
+    address public specialNoFeeToken     = address(0);
 
     /* ---------- 创建销毁规则（可选） ---------- */
     bool    public createBurnEnabled;
-    address public createBurnPricingToken;
+    address public createBurnPricingToken;        // 0 原生
     uint256 public createBurnAmountInToken;
+
+    /* ---------- 留言计费规则（全局） ---------- */
+    bool    public msgPriceEnabled;
+    address public msgPriceToken;                 // 0 原生
+    uint256 public msgPriceAmountInToken;
 
     /* ---------- TWAP（带最小窗口粘性） ---------- */
     struct Obs { uint256 p1Cumulative; uint32 timestamp; bool inited; uint256 lastAvgQ112; }
     mapping(address => Obs) public obsByPair;
     uint32 public minWindowSec = 30;
-    event TwapRolled(address indexed pair, uint256 avgQ112, uint32 ts, uint32 elapsed);
 
     /* ---------- 事件 ---------- */
     event DealImplUpdated(address indexed impl);
@@ -90,22 +124,24 @@ contract DealFactory is Ownable {
     event MinTimeoutUpdated(uint64 seconds_);
     event MinWindowSet(uint32 sec);
     event GlobalSet(string indexed key, address value);
-    event PairCreated(address indexed pair, address indexed otherToken, uint16 feeBps);
-    event PairFeeUpdated(address indexed pair, uint16 newFee);
+    event PairCreated(address indexed pair, address indexed otherToken, uint32 feeNum, uint32 feeDen);
+    event PairFeeUpdated(address indexed pair, uint32 newNum, uint32 newDen);
     event PairMapped(address indexed otherToken, address indexed pair);
-    event FeesAndMintOnFeesUpdated(uint16 nonDLFeePermille, uint16 mintPermilleOnFees);
+    event FeesAndMintOnFeesUpdated(uint32 feeNonDLNum, uint32 feeNonDLDen, uint32 mintOnFeesNum, uint32 mintOnFeesDen);
     event SpecialNoFeeTokenUpdated(address indexed token);
     event CreateBurnRuleUpdated(bool enabled, address pricingToken, uint256 amountInToken);
     event CreateBurnExecuted(address indexed creator, address indexed pair, address pricingToken, uint256 amountInToken, uint256 dlBurned);
     event DealCreated(address indexed deal, address indexed initiator);
-    event DealCreatedV2(address indexed initiator, address indexed aNft, uint256 indexed aNftId, address deal);
+    event DealCreatedV2(address indexed initiator, address indexed deal, uint256 indexed aNftId);
     event DLMinted(address indexed to, uint256 amount, address indexed deal);
-
-    /* ---------- “热索引” ---------- */
-    mapping(address => address[]) private _trackedDealsByUser;
-    mapping(address => mapping(address => uint256)) private _trackedIndexByUser;
+    event MessagePriceRuleUpdated(bool enabled, address pricingToken, uint256 amountInToken);
+    event TwapRolled(address indexed pair, uint256 avgQ112, uint32 ts, uint32 elapsed);
     event TrackedAdded(address indexed user, address indexed deal);
     event TrackedRemoved(address indexed user, address indexed deal);
+
+    /* ---------- 热索引 ---------- */
+    mapping(address => address[]) private _trackedDealsByUser;
+    mapping(address => mapping(address => uint256)) private _trackedIndexByUser;
 
     constructor(address _dealImpl, address _pairImpl, uint64 _minTimeoutSeconds) Ownable(msg.sender) {
         require(_dealImpl != address(0) && _pairImpl != address(0));
@@ -129,38 +165,60 @@ contract DealFactory is Ownable {
         else revert();
         emit GlobalSet(key, value);
     }
+
     function setMinWindowSec(uint32 sec_) external onlyOwner { require(sec_ >= 5); minWindowSec = sec_; emit MinWindowSet(sec_); }
 
-    function setFeesAndMintOnFees(uint16 nonDLFeePermille, uint16 mintPermilleOnFees) external onlyOwner {
-        require(nonDLFeePermille <= 1000 && mintPermilleOnFees <= 1000);
-        defaultFeePermilleNonDL   = nonDLFeePermille;
-        defaultMintPermilleOnFees = mintPermilleOnFees;
-        emit FeesAndMintOnFeesUpdated(nonDLFeePermille, mintPermilleOnFees);
+    function setFeesAndMintOnFees(uint32 feeNonDLNum, uint32 feeNonDLDen, uint32 mintOnFeesNum, uint32 mintOnFeesDen) external onlyOwner {
+        Ratio memory r1 = Ratio({num: feeNonDLNum, den: feeNonDLDen});
+        Ratio memory r2 = Ratio({num: mintOnFeesNum, den: mintOnFeesDen});
+        _assertRatio(r1); _assertRatio(r2);
+        defaultFeeNonDL = r1;
+        defaultMintOnFees = r2;
+        emit FeesAndMintOnFeesUpdated(feeNonDLNum, feeNonDLDen, mintOnFeesNum, mintOnFeesDen);
     }
     function setSpecialNoFeeToken(address token) external onlyOwner { specialNoFeeToken = token; emit SpecialNoFeeTokenUpdated(token); }
 
+    /* ---------- 留言计费规则 ---------- */
+    function setMessagePriceRule(bool enabled, address pricingToken, uint256 amountInToken) external onlyOwner {
+        msgPriceEnabled = enabled;
+        msgPriceToken = pricingToken;                 // 0 表示原生
+        msgPriceAmountInToken = amountInToken;        // 可能为 0（免费）
+        emit MessagePriceRuleUpdated(enabled, pricingToken, amountInToken);
+    }
+
+    /* ---------- 创建销毁规则（可选） ---------- */
     function setCreateBurnRule(bool enabled, address pricingToken, uint256 amountInToken) external onlyOwner {
         createBurnEnabled = enabled; createBurnPricingToken = pricingToken; createBurnAmountInToken = amountInToken;
         emit CreateBurnRuleUpdated(enabled, pricingToken, amountInToken);
     }
 
     /* ========== Pair：创建 / 初始化 / 改费率 ========== */
-    function createPair(address tokenOther, uint16 feeBps) external onlyOwner returns (address pair) {
+    function createPair(address tokenOther, uint32 feeNum, uint32 feeDen) external onlyOwner returns (address pair) {
         require(pairForToken[tokenOther] == address(0), "PAIR_EXISTS");
         require(pairImplementation != address(0) && dlToken != address(0));
         require(tokenOther != address(0) && tokenOther != dlToken);
-        require(feeBps <= 1000);
+        Ratio memory r = Ratio({num: feeNum, den: feeDen}); _assertRatio(r);
 
         pair = pairImplementation.clone();
-        IDealPairInit(pair).initialize(dlToken, tokenOther, address(this), feeBps);
-        emit PairCreated(pair, tokenOther, feeBps);
+        require(pair != address(0), "CLONE_FAILED");
+        require(pair.code.length > 0, "CLONE_NO_CODE");
 
-        pairForToken[tokenOther] = pair; emit PairMapped(tokenOther, pair);
+        IDealPairInit(pair).initialize(dlToken, tokenOther, address(this), feeNum, feeDen);
+        _assertDlPair(pair);
+
+        emit PairCreated(pair, tokenOther, feeNum, feeDen);
+
+        pairForToken[tokenOther] = pair;
+        emit PairMapped(tokenOther, pair);
     }
+
     function initPair(address pair) external onlyOwner returns (uint amountDL, uint amountOther) {
         (amountDL, amountOther) = IDealPairInit(pair).mintInitial();
     }
-    function setPairFeeBps(address pair, uint16 newFee) external onlyOwner { IDealPairInit(pair).setFeeBps(newFee); emit PairFeeUpdated(pair, newFee); }
+    function setPairFee(address pair, uint32 newNum, uint32 newDen) external onlyOwner {
+        IDealPairInit(pair).setFee(newNum, newDen);
+        emit PairFeeUpdated(pair, newNum, newDen);
+    }
     function getPair(address token) external view returns (address) { address t = (token == address(0)) ? wrappedNative : token; return pairForToken[t]; }
     function isTokenSupported(address token) external view returns (bool) { address t = (token == address(0)) ? wrappedNative : token; return pairForToken[t] != address(0); }
 
@@ -168,7 +226,6 @@ contract DealFactory is Ownable {
     function updateAndQuoteToDL(address pair, uint256 amountIn) external returns (uint256 dlOut) {
         require(isDeal[msg.sender]); _assertDlPair(pair); return _updateAndQuoteInternal(pair, amountIn);
     }
-    function _assertDlPair(address pair) internal view { require(pair != address(0) && IDealPairLight(pair).token0() == dlToken); }
     function _currentP1CumulativeWithSpot(address pair) internal view returns (uint256 p1CumNow, uint32 nowTs, uint256 spotQ112) {
         (, p1CumNow, ) = IDealPairLight(pair).getPriceCumulatives();
         (uint112 r0, uint112 r1, uint32 tsRes) = IDealPairLight(pair).getReserves();
@@ -195,7 +252,7 @@ contract DealFactory is Ownable {
     }
 
     /* ========== 创建 Deal ========== */
-    struct CreateParams { IDealV5.InitParams init; bool trackCreator; } // notifyInvite 移除
+    struct CreateParams { IDeal.InitParams init; bool trackCreator; }
 
     function createDeal(CreateParams calldata p) external returns (address deal) {
         require(dealImplementation != address(0));
@@ -203,34 +260,78 @@ contract DealFactory is Ownable {
         require(dlToken != address(0) && wrappedNative != address(0));
 
         if (createBurnEnabled) {
-            address pricingNorm = (createBurnPricingToken == address(0)) ? wrappedNative : createBurnPricingToken;
-            address pair = pairForToken[pricingNorm]; require(pair != address(0)); _assertDlPair(pair);
-            uint256 dlNeed = _updateAndQuoteInternal(pair, createBurnAmountInToken); require(dlNeed > 0);
+            address pricingNormC = (createBurnPricingToken == address(0)) ? wrappedNative : createBurnPricingToken;
+            address pairC = pairForToken[pricingNormC];
+            require(pairC != address(0), "CREATE_BURN_NO_PAIR");
+            _assertDlPair(pairC);
+            uint256 dlNeed = _updateAndQuoteInternal(pairC, createBurnAmountInToken);
+            require(dlNeed > 0, "CREATE_BURN_QTY_0");
             IDLBurnFrom(dlToken).burnFrom(msg.sender, dlNeed);
-            emit CreateBurnExecuted(msg.sender, pair, pricingNorm, createBurnAmountInToken, dlNeed);
+            emit CreateBurnExecuted(msg.sender, pairC, pricingNormC, createBurnAmountInToken, dlNeed);
         }
 
-        deal = dealImplementation.clone(); require(deal != address(0)); isDeal[deal] = true;
+        deal = dealImplementation.clone();
+        require(deal != address(0), "CLONE_FAILED");
+        require(deal.code.length > 0, "CLONE_NO_CODE");
+        isDeal[deal] = true;
 
         address aNorm = (p.init.aSwapToken == address(0)) ? wrappedNative : p.init.aSwapToken;
         address bNorm = (p.init.bSwapToken == address(0)) ? wrappedNative : p.init.bSwapToken;
 
-        IDealV5.ConfigParams memory cfg = IDealV5.ConfigParams({
-            dl: dlToken, infoNft: infoNft, treasury: treasury, WNATIVE: wrappedNative,
-            aTokenNorm: aNorm, bTokenNorm: bNorm, aPair: pairForToken[aNorm], bPair: pairForToken[bNorm],
-            feePermilleNonDL: defaultFeePermilleNonDL, mintPermilleOnFees: defaultMintPermilleOnFees,
+        address msgNorm = (msgPriceToken == address(0)) ? wrappedNative : msgPriceToken;
+        address msgPair = (msgNorm == dlToken) ? address(0) : pairForToken[msgNorm];
+
+        IDeal.ConfigParams memory cfg = IDeal.ConfigParams({
+            dl: dlToken,
+            infoNft: infoNft,
+            treasury: treasury,
+            WNATIVE: wrappedNative,
+            aTokenNorm: aNorm,
+            bTokenNorm: bNorm,
+            aPair: pairForToken[aNorm],
+            bPair: pairForToken[bNorm],
+            feeNonDLNum: defaultFeeNonDL.num,
+            feeNonDLDen: defaultFeeNonDL.den,
+            mintOnFeesNum: defaultMintOnFees.num,
+            mintOnFeesDen: defaultMintOnFees.den,
             specialNoFeeToken: specialNoFeeToken,
-            trackCreator: p.trackCreator
+            trackCreator: p.trackCreator,
+
+            msgPriceEnabled: msgPriceEnabled,
+            msgPriceTokenNorm: msgNorm,
+            msgPricePair: msgPair,
+            msgPriceAmountInToken: msgPriceAmountInToken
         });
-        IDealV5(deal).initialize(address(this), msg.sender, p.init, cfg);
+
+        IDeal(deal).initialize(address(this), msg.sender, p.init, cfg);
 
         emit DealCreated(deal, msg.sender);
-        emit DealCreatedV2(msg.sender, p.init.aNft, p.init.aNftId, deal);
+        emit DealCreatedV2(msg.sender, deal, p.init.aNftId);
     }
 
-    /* ========== 代理增发（仅 Deal） ========== */
+    /* ========== 代理：增发 DL（仅 Deal） ========== */
     modifier onlyDeal() { require(isDeal[msg.sender]); _; }
     function mintDL(address to, uint256 amount) external onlyDeal { require(to != address(0) && amount > 0); IDLMint(dlToken).mint(to, amount); emit DLMinted(to, amount, msg.sender); }
+
+    /* ========== 代理：写 InfoNFT（仅 Deal） ========== */
+    function infoAddMinted(uint256 tokenId, uint256 amount) external onlyDeal {
+        require(infoNft != address(0) && amount > 0, "INFO_NFT/AMOUNT");
+        IDealInfoNFT(infoNft).addMinted(tokenId, amount);
+    }
+    function infoSetMaxPartnerOf(uint256 tokenId, uint256 partnerTokenId) external onlyDeal {
+        require(infoNft != address(0), "INFO_NFT_ZERO");
+        IDealInfoNFT(infoNft).setMaxPartnerOf(tokenId, partnerTokenId);
+    }
+
+    /* ========= 新增：InfoNFT 锁代理（仅 Deal） ========= */
+    function infoLock(uint256 tokenId, address holder) external onlyDeal {
+        require(infoNft != address(0), "INFO_NFT_ZERO");
+        IDealInfoNFTLock(infoNft).lockByFactory(tokenId, msg.sender, holder);
+    }
+    function infoUnlock(uint256 tokenId) external onlyDeal {
+        require(infoNft != address(0), "INFO_NFT_ZERO");
+        IDealInfoNFTLock(infoNft).unlockByFactory(tokenId, msg.sender);
+    }
 
     /* ========== 热索引回调（仅 Deal） ========== */
     function onCreated(address creator, bool trackCreator) external onlyDeal { if (trackCreator) _addTracked(creator, msg.sender); }
@@ -264,4 +365,7 @@ contract DealFactory is Ownable {
         arr.pop(); delete _trackedIndexByUser[user][deal];
         emit TrackedRemoved(user, deal);
     }
+
+    /* ---------- 辅助 ---------- */
+    function _assertDlPair(address pair) internal view { require(pair != address(0) && IDealPairLight(pair).token0() == dlToken); }
 }
