@@ -28,11 +28,9 @@ interface IFactoryLock {
 }
 
 interface IWNATIVE is IERC20 { function deposit() external payable; function withdraw(uint256) external; }
-
-/* ---------- 直连 DL 的 burnFrom ---------- */
 interface IDLBurnFrom { function burnFrom(address account, uint256 amount) external; }
 
-/* ---------- DealInfoNFT（只需要读方法） ---------- */
+/* ---------- DealInfoNFT（只读） ---------- */
 interface IDealInfoNFTView {
     function totalMintedOf(uint256 tokenId) external view returns (uint256);
     function ownerOf(uint256 tokenId) external view returns (address);
@@ -60,12 +58,12 @@ contract Deal is Initializable, ReentrancyGuard {
     JoinMode public joinMode;
     address  public expectedB;
 
-    // 门禁 & NFT（不再转移，仅锁引用）
-    uint256 public gateNftId;       // NftGated 模式要求的 B 侧门禁 tokenId（0 表示无）
-    uint256 public aNftId;          // A 侧绑定的 tokenId（0 表示不使用）
-    uint256 public bNftId;          // B 侧绑定的 tokenId（0 表示不使用）
-    bool    public aNftLocked;      // 本 Deal 是否已对 aNftId 加锁
-    bool    public bNftLocked;      // 本 Deal 是否已对 bNftId 加锁
+    // 门禁 & NFT（仅锁引用）
+    uint256 public gateNftId;
+    uint256 public aNftId;
+    uint256 public bNftId;
+    bool    public aNftLocked;
+    bool    public bNftLocked;
 
     // 置换 & 保证金
     address public aSwapToken;   uint256 public aSwapAmount;
@@ -82,7 +80,7 @@ contract Deal is Initializable, ReentrancyGuard {
     uint64 public aAcceptAt; uint64 public bAcceptAt;
     Vote   public aVote;     Vote   public bVote;
 
-    // 提取标记
+    // 兼容旧逻辑（自动结算后置 true）
     bool public aClaimed; bool public bClaimed;
 
     // 完成后的净置换额
@@ -97,26 +95,26 @@ contract Deal is Initializable, ReentrancyGuard {
     address public aTokenNorm; address public bTokenNorm;
     address public aPair;      address public bPair;
 
-    // 分子/分母式手续费/奖励比例
+    // 手续费/奖励比例
     uint32  public feeNonDLNum;    uint32 public feeNonDLDen;
-    uint32  public mintOnFeesNum;  uint32 public mintOnFeesDen;
+    uint32  public mintOnFeesNum;  uint32  public mintOnFeesDen;
     address public specialNoFeeToken;
 
     bool private _trackA;
     bool private _trackBActive;
 
-    /* ===== 留言计费配置（由 Factory 下发） ===== */
+    /* ===== 留言计费 ===== */
     bool    public msgPriceEnabled;
-    address public msgPriceTokenNorm;     // 计价 token 的归一化地址（0=>WNATIVE）
-    address public msgPricePair;          // DL↔计价token 的 Pair（若计价token=DL，则可为0）
-    uint256 public msgPriceAmountInToken; // 每条留言按计价token计的金额
+    address public msgPriceTokenNorm;
+    address public msgPricePair;
+    uint256 public msgPriceAmountInToken;
 
     /* ===== 留言存储 ===== */
     string[]  private _msgContents;
     uint64[]  private _msgTimes;
     address[] private _msgSenders;
 
-    /* 事件（保留形参，恒定填 infoNft） */
+    /* 事件 */
     event Initialized(address indexed initiator, address indexed factory);
     event Joined(address indexed b, bool nftLockedB);
     event Locked();
@@ -126,7 +124,6 @@ contract Deal is Initializable, ReentrancyGuard {
     event FeesProcessed(address indexed tokenA, uint256 aFee, address indexed tokenB, uint256 bFee);
     event RewardsMinted(address indexed a, uint256 toA, address indexed b, uint256 toB, address indexed cAddr, uint256 toC);
 
-    /* 新增事件：留言与扣费 */
     event MessagePosted(address indexed from, uint256 indexed idx, uint64 ts, string content);
     event MessageFeeCharged(address indexed from, uint256 dlBurned, address indexed tokenNorm, uint256 tokenAmount);
 
@@ -141,8 +138,8 @@ contract Deal is Initializable, ReentrancyGuard {
         address bSwapToken;   uint256 bSwapAmount;
         address bMarginToken; uint256 bMarginAmount;
         uint8   joinMode;     address expectedB;
-        uint256 gateNftId;    // 仅 NftGated 使用；其他模式可为 0
-        uint256 aNftId;       // A 侧绑定 NFT；0 表示不绑定
+        uint256 gateNftId;
+        uint256 aNftId;
         string  title;        uint64  timeoutSeconds;
     }
     struct ConfigParams {
@@ -152,12 +149,7 @@ contract Deal is Initializable, ReentrancyGuard {
         uint32  mintOnFeesNum; uint32 mintOnFeesDen;
         address specialNoFeeToken;
         bool    trackCreator;
-
-        // 留言计费
-        bool    msgPriceEnabled;
-        address msgPriceTokenNorm;
-        address msgPricePair;
-        uint256 msgPriceAmountInToken;
+        bool    msgPriceEnabled; address msgPriceTokenNorm; address msgPricePair; uint256 msgPriceAmountInToken;
     }
 
     function initialize(address _factory, address _initiator, InitParams calldata p, ConfigParams calldata c)
@@ -175,11 +167,8 @@ contract Deal is Initializable, ReentrancyGuard {
         require(mintOnFeesDen>0 && mintOnFeesNum<mintOnFeesDen, "MINT_RATIO");
         specialNoFeeToken=c.specialNoFeeToken;
 
-        // 留言计费配置
-        msgPriceEnabled        = c.msgPriceEnabled;
-        msgPriceTokenNorm      = c.msgPriceTokenNorm;
-        msgPricePair           = c.msgPricePair;
-        msgPriceAmountInToken  = c.msgPriceAmountInToken;
+        msgPriceEnabled=c.msgPriceEnabled; msgPriceTokenNorm=c.msgPriceTokenNorm;
+        msgPricePair=c.msgPricePair; msgPriceAmountInToken=c.msgPriceAmountInToken;
 
         aSwapToken=p.aSwapToken; aSwapAmount=p.aSwapAmount; aMarginToken=p.aMarginToken; aMarginAmount=p.aMarginAmount;
         bSwapToken=p.bSwapToken; bSwapAmount=p.bSwapAmount; bMarginToken=p.bMarginToken; bMarginAmount=p.bMarginAmount;
@@ -188,9 +177,9 @@ contract Deal is Initializable, ReentrancyGuard {
         joinMode  = JoinMode(p.joinMode);
         expectedB = p.expectedB;
 
-        gateNftId = p.gateNftId;   // 仅在 NftGated 模式有效（可非零）
-        aNftId    = p.aNftId;      // 0 表示 A 不绑定
-        bNftId    = 0;             // 后续在 join 决定
+        gateNftId = p.gateNftId;
+        aNftId    = p.aNftId;
+        bNftId    = 0;
 
         title=p.title; timeoutSeconds=p.timeoutSeconds;
 
@@ -209,37 +198,30 @@ contract Deal is Initializable, ReentrancyGuard {
     }
 
     /* ======================= 留言 ======================= */
-
     function postMessage(string calldata content) external nonReentrant onlyAB returns (uint256 idx) {
         require(bytes(content).length > 0, "EMPTY");
-
         _chargeMessageFee(msg.sender);
-
         uint64 ts = uint64(block.timestamp);
-        _msgContents.push(content);
-        _msgTimes.push(ts);
-        _msgSenders.push(msg.sender);
-
+        _msgContents.push(content); _msgTimes.push(ts); _msgSenders.push(msg.sender);
         idx = _msgContents.length - 1;
         emit MessagePosted(msg.sender, idx, ts, content);
     }
-
     function getMessages(uint256 offset, uint256 limit)
-        external view
-        returns (string[] memory contents, uint64[] memory times, address[] memory senders)
+        external view returns (string[] memory contents, uint64[] memory times, address[] memory senders)
     {
         uint256 len = _msgContents.length;
-        if (offset >= len) { return (new string[](0), new uint64[](0), new address[](0)); }
-        uint256 end = offset + limit; if (end > len) end = len;uint256 n = end - offset;
-        contents = new string[](n);times    = new uint64[](n);senders  = new address[](n);
-        for (uint256 i = 0; i < n; ++i) { contents[i] = _msgContents[offset + i]; times[i] = _msgTimes[offset + i]; senders[i] = _msgSenders[offset + i]; }
+        if (offset >= len) return (new string[](0), new uint64[](0), new address[](0));
+        uint256 end = offset + limit; if (end > len) end = len; uint256 n = end - offset;
+        contents = new string[](n); times = new uint64[](n); senders = new address[](n);
+        for (uint256 i=0; i<n; ++i) { contents[i]=_msgContents[offset+i]; times[i]=_msgTimes[offset+i]; senders[i]=_msgSenders[offset+i]; }
     }
     function messagesCount() external view returns (uint256) { return _msgContents.length; }
 
     function _chargeMessageFee(address payer) internal {
         if (!msgPriceEnabled || msgPriceAmountInToken == 0) return;
-        uint256 dlNeed;
-        dlNeed = msgPriceTokenNorm == dl ? msgPriceAmountInToken : _quoteAggToDL(msgPriceTokenNorm, msgPricePair, msgPriceAmountInToken);
+        uint256 dlNeed = (msgPriceTokenNorm == dl)
+            ? msgPriceAmountInToken
+            : _quoteAggToDL(msgPriceTokenNorm, msgPricePair, msgPriceAmountInToken);
         if (dlNeed > 0) IDLBurnFrom(dl).burnFrom(payer, dlNeed);
         emit MessageFeeCharged(payer, dlNeed, msgPriceTokenNorm, msgPriceAmountInToken);
     }
@@ -247,10 +229,7 @@ contract Deal is Initializable, ReentrancyGuard {
     /* ========== A：改四数 / 废弃 ========== */
     function updateAmounts(uint256 _aSwapAmount, uint256 _aMarginAmount, uint256 _bSwapAmount, uint256 _bMarginAmount)
         external onlyA inState(Status.Ready)
-    {
-        aSwapAmount=_aSwapAmount; aMarginAmount=_aMarginAmount;
-        bSwapAmount=_bSwapAmount; bMarginAmount=_bMarginAmount;
-    }
+    { aSwapAmount=_aSwapAmount; aMarginAmount=_aMarginAmount; bSwapAmount=_bSwapAmount; bMarginAmount=_bMarginAmount; }
 
     function abandonByA() external nonReentrant onlyA {
         require(status == Status.Ready || status == Status.Active);
@@ -258,10 +237,9 @@ contract Deal is Initializable, ReentrancyGuard {
 
         _refundAllToParties();
 
-        // 解锁（如果之前已锁）
         _unlockNftIfLocked(true);
         _unlockNftIfLocked(false);
-        bNftId = 0; // 重置
+        bNftId = 0;
 
         if (_trackA && _trackBActive) IFactoryIndex(factory).onAbandoned(a, prevB);
         else if (_trackA)             IFactoryIndex(factory).onAbandoned(a, address(0));
@@ -280,22 +258,16 @@ contract Deal is Initializable, ReentrancyGuard {
             require(IERC721(infoNft).ownerOf(gateNftId) == msg.sender, "not nft owner");
             b = msg.sender; bNftId = gateNftId;
         } else {
-            if (joinMode == JoinMode.ExactAddress) {
-                require(msg.sender == expectedB, "not expectedB");
-            }
+            if (joinMode == JoinMode.ExactAddress) require(msg.sender == expectedB, "not expectedB");
             b = msg.sender;
             if (optId > 0) {
                 require(IERC721(infoNft).ownerOf(optId) == msg.sender, "not nft owner");
                 bNftId = optId;
             }
         }
-
-        // 加锁b
         _lockNftForBIfAny();
-
         _trackBActive = trackMe;
         if (_trackBActive) IFactoryIndex(factory).onJoined(b, true);
-
         status = Status.Active;
         emit Joined(b, bNftLocked);
         _tryLock();
@@ -335,24 +307,17 @@ contract Deal is Initializable, ReentrancyGuard {
         require(msg.sender == b);
         address prevB = b;
         _refundFundsA(); _refundFundsB();
-
-        // 解锁b
         _unlockNftIfLocked(false);
-        bNftId = 0; // 重置
-
+        bNftId = 0;
         if (_trackBActive) { IFactoryIndex(factory).onParticipantRemoved(prevB); _trackBActive = false; }
-
         b = address(0); status = Status.Ready;
     }
 
     function kickBByA() external nonReentrant onlyA inState(Status.Active) {
         address prevB = b;
         _refundFundsA(); _refundFundsB();
-
-        // 解锁b
         _unlockNftIfLocked(false);
-        bNftId = 0; // 重置
-
+        bNftId = 0;
         if (_trackBActive) { IFactoryIndex(factory).onParticipantRemoved(prevB); _trackBActive = false; }
         b = address(0); status = Status.Ready;
     }
@@ -377,66 +342,64 @@ contract Deal is Initializable, ReentrancyGuard {
         } else { revert("BAD_FORCE"); }
     }
 
-    /* ========== 完成 / 取消 / 提取 ========== */
+    /* ========== 完成 / 取消（自动结算） ========== */
     struct Fees    { uint256 aFee; uint256 bFee; }
     struct Rewards { uint256 toA;  uint256 toB;  uint256 toC; address cAddr; uint256 cToken; }
 
+    // 完成：当场派发 & 清理
     function _complete(CompletionReason reason) internal {
         Fees memory f = _computeFees();
         _processFees(f); emit FeesProcessed(aSwapToken, f.aFee, bSwapToken, f.bFee);
 
         Rewards memory r = _computeRewardsFromFees(f);
-        _mintAndRecord(r);               // 代理增发 + 写 InfoNFT
-        _refreshMaxPointers();           // 代理写 InfoNFT
+        _mintAndRecord(r);
+        _refreshMaxPointers();
 
-        // 解锁（本 Deal 对应的锁 -1）
+        // 内部标记
+        aPaid = false; bPaid = false;
+        aClaimed = true; bClaimed = true;
+
+        // === 结算派发（完成态） ===
+        _sendOut(bSwapToken, a, bSwapNetForA);
+        _sendOut(aMarginToken, a, aMarginAmount);
+        emit Claimed(a, bSwapToken, bSwapNetForA, aMarginToken, aMarginAmount);
+
+        _sendOut(aSwapToken, b, aSwapNetForB);
+        _sendOut(bMarginToken, b, bMarginAmount);
+        emit Claimed(b, aSwapToken, aSwapNetForB, bMarginToken, bMarginAmount);
+
+        // 解锁 NFT + 清理热索引
         _unlockNftIfLocked(true);
         _unlockNftIfLocked(false);
+        if (_trackA)       { IFactoryIndex(factory).onClosedFor(a); _trackA = false; }
+        if (_trackBActive) { IFactoryIndex(factory).onClosedFor(b); _trackBActive = false; }
 
         status = Status.Completed;
         emit Completed(reason);
     }
 
+    // 取消：当场退款 & 清理
     function _cancel() internal {
-        // 解锁（本 Deal 对应的锁 -1）
+        if (aPaid) {
+            aPaid = false; aClaimed = true;
+            _sendOut(aSwapToken, a, aSwapAmount);
+            _sendOut(aMarginToken, a, aMarginAmount);
+            emit Claimed(a, aSwapToken, aSwapAmount, aMarginToken, aMarginAmount);
+        }
+        if (bPaid) {
+            bPaid = false; bClaimed = true;
+            _sendOut(bSwapToken, b, bSwapAmount);
+            _sendOut(bMarginToken, b, bMarginAmount);
+            emit Claimed(b, bSwapToken, bSwapAmount, bMarginToken, bMarginAmount);
+        }
+
         _unlockNftIfLocked(true);
         _unlockNftIfLocked(false);
-
-        status = Status.Canceled; emit Canceled();
-    }
-
-    function claimA() external nonReentrant {
-        require(msg.sender == a);
-        require(status == Status.Completed || status == Status.Canceled);
-        require(!aClaimed); aClaimed = true;
-
-        if (status == Status.Completed) { _sendOut(bSwapToken, a, bSwapNetForA); _sendOut(aMarginToken, a, aMarginAmount); }
-        else { _sendOut(aSwapToken, a, aSwapAmount); _sendOut(aMarginToken, a, aMarginAmount); }
-
-        emit Claimed(a,
-            status == Status.Completed ? bSwapToken : aSwapToken,
-            status == Status.Completed ? bSwapNetForA : aSwapAmount,
-            aMarginToken, aMarginAmount
-        );
-
-        if (_trackA) { IFactoryIndex(factory).onClosedFor(a); _trackA = false; }
-    }
-
-    function claimB() external nonReentrant {
-        require(msg.sender == b);
-        require(status == Status.Completed || status == Status.Canceled);
-        require(!bClaimed); bClaimed = true;
-
-        if (status == Status.Completed) { _sendOut(aSwapToken, b, aSwapNetForB); _sendOut(bMarginToken, b, bMarginAmount); }
-        else { _sendOut(bSwapToken, b, bSwapAmount); _sendOut(bMarginToken, b, bMarginAmount); }
-
-        emit Claimed(b,
-            status == Status.Completed ? aSwapToken : bSwapToken,
-            status == Status.Completed ? aSwapNetForB : bSwapAmount,
-            bMarginToken, bMarginAmount
-        );
-
+        if (_trackA)       { IFactoryIndex(factory).onClosedFor(a); _trackA = false; }
         if (_trackBActive) { IFactoryIndex(factory).onClosedFor(b); _trackBActive = false; }
+
+        status = Status.Canceled;
+        emit Canceled();
     }
 
     /* ========== 手续费 & 入池 ========== */
@@ -446,19 +409,16 @@ contract Deal is Initializable, ReentrancyGuard {
         if (specialNoFeeToken != address(0) && tNorm == specialNoFeeToken) return true;
         return false;
     }
-
     function _computeFees() internal returns (Fees memory f) {
         f.aFee = _isNoFeeToken(aSwapToken) ? 0 : (aSwapAmount * feeNonDLNum) / feeNonDLDen;
         f.bFee = _isNoFeeToken(bSwapToken) ? 0 : (bSwapAmount * feeNonDLNum) / feeNonDLDen;
         aSwapNetForB = aSwapAmount - f.aFee;
         bSwapNetForA = bSwapAmount - f.bFee;
     }
-
     function _processFees(Fees memory f) internal {
         _handleOneSideFees(aSwapToken, aTokenNorm, aPair, f.aFee);
         _handleOneSideFees(bSwapToken, bTokenNorm, bPair, f.bFee);
     }
-
     function _handleOneSideFees(address token, address tokenNorm, address pair, uint256 fee) internal {
         if (fee == 0) return;
         if (pair != address(0)) {
@@ -499,7 +459,6 @@ contract Deal is Initializable, ReentrancyGuard {
             r.toC    = share;
         }
 
-        // 余数 → A（若 A 参与）
         uint256 used = (hasA ? share : 0) + (hasB ? share : 0) + (r.toC);
         uint256 rem = (totalToMint > used) ? (totalToMint - used) : 0;
         if (rem > 0 && hasA) r.toA += rem;
@@ -543,11 +502,9 @@ contract Deal is Initializable, ReentrancyGuard {
     function _preferFirstMax2(uint256 id1, uint256 s1, uint256 id2, uint256 s2) internal pure returns (uint256) {
         if (s2 > s1) return id2; return id1;
     }
-    function _preferFirstMax3(
-        uint256 id1, uint256 s1,
-        uint256 id2, uint256 s2,
-        uint256 id3, uint256 s3
-    ) internal pure returns (uint256) {
+    function _preferFirstMax3(uint256 id1, uint256 s1, uint256 id2, uint256 s2, uint256 id3, uint256 s3)
+        internal pure returns (uint256)
+    {
         if (s1 >= s2 && s1 >= s3) return id1;
         if (s2 >= s3) return id2;
         return id3;
