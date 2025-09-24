@@ -51,6 +51,7 @@ interface IDealPairLight {
 }
 interface IDealPairInit {
     function initialize(address dlToken, address otherToken, address factory_, uint32 feeNum_, uint32 feeDen_) external;
+    function setFactory(address f) external;
     function setFee(uint32 newNum, uint32 newDen) external;
     function mintInitial() external returns (uint amountDL, uint amountOther);
 }
@@ -212,6 +213,9 @@ contract DealFactory is Ownable {
         emit PairMapped(tokenOther, pair);
     }
 
+    function setPairFactory(address pair, address f) external onlyOwner {
+        IDealPairInit(pair).setFactory(f);
+    }
     function initPair(address pair) external onlyOwner returns (uint amountDL, uint amountOther) {
         (amountDL, amountOther) = IDealPairInit(pair).mintInitial();
     }

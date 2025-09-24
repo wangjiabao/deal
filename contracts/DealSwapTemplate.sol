@@ -190,6 +190,9 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
     }
 
     /* ---------------- Governance (Factory only) ---------------- */
+    function setFactory(address f) external onlyFactory {
+        factory = f;
+    }
 
     /// Factory 调整本 Pair 的手续费
     function setFee(uint32 newNum, uint32 newDen) external onlyFactory {
