@@ -7,7 +7,6 @@ pragma solidity ^0.8.26;
   - 所有 swap 均带 deadline + minOut / maxIn
   - 报价→成交：先转入→按“实际到帐”报价→再 swap（抗扣税 OTHER）
   - 覆盖：单跳 / 双跳（A↔DL↔B）/ ETH 便捷双跳
-  - 为避免 “stack too deep”，heavy 步骤封装到 internal，外层仅发事件，不返回数值
 */
 
 import "./interfaces/IERC20.sol";
