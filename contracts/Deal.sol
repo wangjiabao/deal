@@ -77,7 +77,7 @@ contract Deal is Initializable, ReentrancyGuard {
     // 锁定/投票/超时
     uint64 public lockedAt;
     uint64 public timeoutSeconds;
-    uint64 public aAcceptAt; uint64 public bAcceptAt;
+    uint64 public aAt; uint64 public bAt;
     Vote   public aVote;     Vote   public bVote;
 
     // 兼容旧逻辑（自动结算后置 true）
@@ -250,7 +250,7 @@ contract Deal is Initializable, ReentrancyGuard {
     }
 
     /* ========== B：进入 ========== */
-    function join(uint256 optId, bool trackMe) external inState(Status.Ready) {
+    function join(uint256 optId, bool trackMe) external nonReentrant inState(Status.Ready) {
         require(b == address(0));
         require(a != msg.sender, "is a");
         if (joinMode == JoinMode.NftGated) {
@@ -265,7 +265,9 @@ contract Deal is Initializable, ReentrancyGuard {
                 bNftId = optId;
             }
         }
+
         _lockNftForBIfAny();
+        
         _trackBActive = trackMe;
         if (_trackBActive) IFactoryIndex(factory).onJoined(b, true);
         status = Status.Active;
@@ -324,22 +326,32 @@ contract Deal is Initializable, ReentrancyGuard {
 
     /* ========== Locked：投票 / 强制完成 / 取消 ========== */
     function setMyVote(Vote v) external nonReentrant inState(Status.Locked) onlyAB {
-        require(v != Vote.Unset, "V_UNSET");
-        if (msg.sender == a) { aVote = v; aAcceptAt = (v == Vote.Accept) ? uint64(block.timestamp) : 0; }
-        else { bVote = v; bAcceptAt = (v == Vote.Accept) ? uint64(block.timestamp) : 0; }
+        require(v == Vote.Accept || v == Vote.Reject, "V_UNSET");
+        if (msg.sender == a) { aVote = v; aAt = uint64(block.timestamp); }
+        else { bVote = v; bAt = uint64(block.timestamp); }
 
         if (aVote == Vote.Accept && bVote == Vote.Accept) _complete(CompletionReason.BothAccepted);
         else if (aVote == Vote.Reject && bVote == Vote.Reject) _cancel();
     }
 
     function forceComplete() external nonReentrant inState(Status.Locked) onlyAB {
-        if (msg.sender == a && aVote == Vote.Accept && bVote == Vote.Unset) {
-            require(block.timestamp >= uint256(aAcceptAt) + uint256(timeoutSeconds), "A_NOT_TIMEOUT");
-            _complete(CompletionReason.ForcedByA);
-        } else if (msg.sender == b && bVote == Vote.Accept && aVote == Vote.Unset) {
-            require(block.timestamp >= uint256(bAcceptAt) + uint256(timeoutSeconds), "B_NOT_TIMEOUT");
-            _complete(CompletionReason.ForcedByB);
-        } else { revert("BAD_FORCE"); }
+        if (msg.sender == a && bVote == Vote.Unset) {
+            require(block.timestamp >= uint256(aAt) + uint256(timeoutSeconds), "A_NOT_TIMEOUT");
+            if (aVote == Vote.Accept) {
+                _complete(CompletionReason.ForcedByA); return;
+            } else if (aVote == Vote.Reject) {
+                _cancel(); return;
+            }
+        } else if (msg.sender == b && aVote == Vote.Unset) {
+            require(block.timestamp >= uint256(bAt) + uint256(timeoutSeconds), "B_NOT_TIMEOUT");
+            if (bVote == Vote.Accept) {
+                _complete(CompletionReason.ForcedByB); return;
+            } else if (bVote == Vote.Reject) {
+                _cancel(); return;
+            }
+        } 
+        
+        revert("BAD_FORCE");
     }
 
     /* ========== 完成 / 取消（自动结算） ========== */
@@ -588,7 +600,7 @@ contract Deal is Initializable, ReentrancyGuard {
         if (_isSideReadyA() && _isSideReadyB()) {
             status = Status.Locked;
             lockedAt = uint64(block.timestamp);
-            aVote = Vote.Unset; bVote = Vote.Unset; aAcceptAt = 0; bAcceptAt = 0;
+            aVote = Vote.Unset; bVote = Vote.Unset; aAt = 0; bAt = 0;
             emit Locked();
         }
     }

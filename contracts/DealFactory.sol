@@ -75,6 +75,8 @@ contract DealFactory is Ownable {
     using Clones for address;
     using SafeERC20 for IERC20;
 
+    address public admin;
+
     /* ---------- 数学工具 ---------- */
     error RatioInvalid();
     struct Ratio { uint32 num; uint32 den; }
@@ -144,30 +146,39 @@ contract DealFactory is Ownable {
     mapping(address => address[]) private _trackedDealsByUser;
     mapping(address => mapping(address => uint256)) private _trackedIndexByUser;
 
+    /* ---------------- Modifiers ---------------- */
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "NOT_ADMIN");
+        _;
+    }
+
     constructor(address _dealImpl, address _pairImpl, uint64 _minTimeoutSeconds) Ownable(msg.sender) {
         require(_dealImpl != address(0) && _pairImpl != address(0));
         require(_minTimeoutSeconds >= 3600);
-        dealImplementation = _dealImpl; pairImplementation = _pairImpl; minTimeoutSeconds = _minTimeoutSeconds;
+        dealImplementation = _dealImpl; pairImplementation = _pairImpl; minTimeoutSeconds = _minTimeoutSeconds; admin = msg.sender;
         emit DealImplUpdated(_dealImpl); emit PairImplUpdated(_pairImpl); emit MinTimeoutUpdated(_minTimeoutSeconds);
     }
 
-    /* ========== Owner 配置 ========== */
+    /* ========== Owner Admin 配置 ========== */
     function setDealImplementation(address impl) external onlyOwner { require(impl != address(0)); dealImplementation = impl; emit DealImplUpdated(impl); }
     function setPairImplementation(address impl) external onlyOwner { require(impl != address(0)); pairImplementation = impl; emit PairImplUpdated(impl); }
-    function setMinTimeoutSeconds(uint64 s) external onlyOwner { require(s >= 3600); minTimeoutSeconds = s; emit MinTimeoutUpdated(s); }
+    function setMinTimeoutSeconds(uint64 s) external onlyOwner { require(s >= 1800); minTimeoutSeconds = s; emit MinTimeoutUpdated(s); }
+    
+    function setAdmin(address _admin) external onlyAdmin { admin = _admin; }
+    function setMinTimeoutSecondsByAdmin(uint64 s) external onlyAdmin { require(s >= 3600); minTimeoutSeconds = s; emit MinTimeoutUpdated(s); }
 
     /// key ∈ {"dlToken","infoNft","treasury","wrappedNative"}
     function setGlobal(string calldata key, address value) external onlyOwner {
         bytes32 k = keccak256(bytes(key));
         if      (k == keccak256("dlToken"))       dlToken = value;
         else if (k == keccak256("infoNft"))       infoNft = value;
-        else if (k == keccak256("treasury"))      treasury = value;
         else if (k == keccak256("wrappedNative")) wrappedNative = value;
         else revert();
         emit GlobalSet(key, value);
     }
 
     function setMinWindowSec(uint32 sec_) external onlyOwner { require(sec_ >= 5); minWindowSec = sec_; emit MinWindowSet(sec_); }
+    function setMinWindowSecByAdmin(uint32 sec_) external onlyAdmin { require(sec_ >= 30); minWindowSec = sec_; emit MinWindowSet(sec_); }
 
     function setFeesAndMintOnFees(uint32 feeNonDLNum, uint32 feeNonDLDen, uint32 mintOnFeesNum, uint32 mintOnFeesDen) external onlyOwner {
         Ratio memory r1 = Ratio({num: feeNonDLNum, den: feeNonDLDen});
@@ -177,20 +188,39 @@ contract DealFactory is Ownable {
         defaultMintOnFees = r2;
         emit FeesAndMintOnFeesUpdated(feeNonDLNum, feeNonDLDen, mintOnFeesNum, mintOnFeesDen);
     }
-    function setSpecialNoFeeToken(address token) external onlyOwner { specialNoFeeToken = token; emit SpecialNoFeeTokenUpdated(token); }
+    function setFeesAndMintOnFeesByAdmin(uint32 feeNonDLNum, uint32 mintOnFeesNum) external onlyAdmin {
+        require(1 <= feeNonDLNum && 10 >= feeNonDLNum);
+        require(1 <= mintOnFeesNum && 10 >= mintOnFeesNum);
+        Ratio memory r1 = Ratio({num: feeNonDLNum, den: 1000});
+        Ratio memory r2 = Ratio({num: mintOnFeesNum, den: 1000});
+        _assertRatio(r1); _assertRatio(r2);
+        defaultFeeNonDL = r1;
+        defaultMintOnFees = r2;
+        emit FeesAndMintOnFeesUpdated(feeNonDLNum, 1000, mintOnFeesNum, 1000);
+    }
+    function setSpecialNoFeeTokenByAdmin(address token) external onlyAdmin { specialNoFeeToken = token; emit SpecialNoFeeTokenUpdated(token); }
+    function setTreasuryByAdmin(address _treasury) external onlyAdmin { treasury =  _treasury; }
 
     /* ---------- 留言计费规则 ---------- */
     function setMessagePriceRule(bool enabled, address pricingToken, uint256 amountInToken) external onlyOwner {
-        msgPriceEnabled = enabled;
-        msgPriceToken = pricingToken;                 // 0 表示原生
-        msgPriceAmountInToken = amountInToken;        // 可能为 0（免费）
+        msgPriceEnabled = enabled; msgPriceToken = pricingToken; msgPriceAmountInToken = amountInToken;
         emit MessagePriceRuleUpdated(enabled, pricingToken, amountInToken);
+    }
+    function setMessagePriceRuleByAdmin(uint256 amountInToken) external onlyAdmin {
+        require(amountInToken >= 1 * 10**16 && amountInToken <= 10 * 10**18);
+        msgPriceAmountInToken = amountInToken;
+        emit MessagePriceRuleUpdated(msgPriceEnabled, msgPriceToken, amountInToken);
     }
 
     /* ---------- 创建销毁规则（可选） ---------- */
     function setCreateBurnRule(bool enabled, address pricingToken, uint256 amountInToken) external onlyOwner {
         createBurnEnabled = enabled; createBurnPricingToken = pricingToken; createBurnAmountInToken = amountInToken;
         emit CreateBurnRuleUpdated(enabled, pricingToken, amountInToken);
+    }
+    function setCreateBurnRuleByAdmin(uint256 amountInToken) external onlyAdmin {
+        require(amountInToken >= 1 * 10**16 && amountInToken <= 100 * 10**18);
+        createBurnAmountInToken = amountInToken;
+        emit CreateBurnRuleUpdated(createBurnEnabled, createBurnPricingToken, amountInToken);
     }
 
     /* ========== Pair：创建 / 初始化 / 改费率 ========== */
@@ -223,12 +253,17 @@ contract DealFactory is Ownable {
         IDealPairInit(pair).setFee(newNum, newDen);
         emit PairFeeUpdated(pair, newNum, newDen);
     }
+     function setPairFeeByAdmin(address pair, uint32 newNum) external onlyAdmin {
+         require(1 <= newNum && 100 >= newNum);
+        IDealPairInit(pair).setFee(newNum, 10000);
+        emit PairFeeUpdated(pair, newNum, 10000);
+    }
     function getPair(address token) external view returns (address) { address t = (token == address(0)) ? wrappedNative : token; return pairForToken[t]; }
     function isTokenSupported(address token) external view returns (bool) { address t = (token == address(0)) ? wrappedNative : token; return pairForToken[t] != address(0); }
 
     /* ========== TWAP：供 Deal 调用报价 ========== */
     function updateAndQuoteToDL(address pair, uint256 amountIn) external returns (uint256 dlOut) {
-        require(isDeal[msg.sender]); _assertDlPair(pair); return _updateAndQuoteInternal(pair, amountIn);
+        require(isDeal[msg.sender] || infoNft == msg.sender); _assertDlPair(pair); return _updateAndQuoteInternal(pair, amountIn);
     }
     function _currentP1CumulativeWithSpot(address pair) internal view returns (uint256 p1CumNow, uint32 nowTs, uint256 spotQ112) {
         (, p1CumNow, ) = IDealPairLight(pair).getPriceCumulatives();

@@ -47,8 +47,7 @@ contract DealSwapTemplate is Initializable, ReentrancyGuard {
     event DustPurged(uint256 dlAmount);
     event FeeBurned(uint256 dlAmount);
 
-    // amount0In/Out 表示 DL，amount1In/Out 表示 OTHER
-    // 新增 amount0OutNet（仅买 DL 时有意义）
+    // amount0In/Out 表示 DL，amount1In/Out 表示 OTHER，amount0OutNet（仅买 DL 时有意义）
     event Swap(
         address indexed sender,
         uint256 amount0In,        // DL in

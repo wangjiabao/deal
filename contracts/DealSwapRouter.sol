@@ -6,7 +6,7 @@ pragma solidity ^0.8.26;
   - 支持 ERC20 与 原生币 via WNATIVE
   - 所有 swap 均带 deadline + minOut / maxIn
   - 报价→成交：先转入→按“实际到帐”报价→再 swap（抗扣税 OTHER）
-  - 覆盖：单跳 / 双跳（A↔DL↔B）/ ETH 便捷双跳
+  - 覆盖：单跳 / 双跳（A↔DL↔B）/ ETH 便捷双跳（四条路径已对称齐全）
 */
 
 import "./interfaces/IERC20.sol";
@@ -28,21 +28,27 @@ contract DealRouter is ReentrancyGuard {
     receive() external payable { require(msg.sender == WNATIVE, "ETH_NOT_ALLOWED"); }
 
     /* ---------------- events ---------------- */
+    // —— 单跳 —— //
     event SwapExact1For0(address indexed pair, address indexed sender, uint256 in1, uint256 out0Net, uint256 out0Gross, uint256 feeOut, address indexed to);
     event Swap1ForExact0Net(address indexed pair, address indexed sender, uint256 in1Used, uint256 out0Net, uint256 out0Gross, uint256 feeOut, address indexed to);
     event SwapExact0For1(address indexed pair, address indexed sender, uint256 in0, uint256 out1, uint256 feeIn, address indexed to);
     event Swap0ForExact1(address indexed pair, address indexed sender, uint256 in0Used, uint256 out1Target, uint256 feeIn, address indexed to);
 
+    // —— 单跳（ETH/BNB via WNATIVE） —— //
     event SwapExactETHFor0(address indexed pair, address indexed sender, uint256 ethIn, uint256 out0Net, uint256 out0Gross, uint256 feeOut, address indexed to);
     event SwapETHForExact0Net(address indexed pair, address indexed sender, uint256 ethUsed, uint256 out0Net, uint256 out0Gross, uint256 feeOut, uint256 ethRefund, address indexed to);
     event SwapExact0ForETH(address indexed pair, address indexed sender, uint256 in0, uint256 ethOut, uint256 feeIn, address indexed to);
     event Swap0ForExactETH(address indexed pair, address indexed sender, uint256 in0Used, uint256 ethOutTarget, uint256 feeIn, address indexed to);
 
+    // —— 双跳（A ↔ DL ↔ B，ERC20） —— //
     event SwapExact1For1ViaDL(address indexed pairA, address indexed pairB, address indexed sender, uint256 inA, uint256 dlNet, uint256 outB, uint256 feeOutDL, uint256 feeInDL, address to);
     event Swap1ForExact1ViaDL(address indexed pairA, address indexed pairB, address indexed sender, uint256 inAUsed, uint256 dlRequired, uint256 outBTarget, uint256 feeOutDL, uint256 feeInDL, uint256 dlRefund, address to);
 
+    // —— 双跳便捷（ETH ↔ DL ↔ ERC20） —— //
     event SwapExactETHFor1ViaDL(address indexed pairWNATIVE, address indexed pairB, address indexed sender, uint256 ethIn, uint256 dlNet, uint256 outB, uint256 feeOutDL, uint256 feeInDL, address to);
     event Swap1ForExactETHViaDL(address indexed pairA, address indexed pairWNATIVE, address indexed sender, uint256 inAUsed, uint256 dlRequired, uint256 outETHTarget, uint256 feeOutDL, uint256 feeInDL, uint256 dlRefund, address to);
+    event SwapExact1ForETHViaDL(address indexed pairA, address indexed pairWNATIVE, address indexed sender, uint256 inA, uint256 dlNet, uint256 ethOut, uint256 feeOutDL, uint256 feeInDL, address to);
+    event SwapETHForExact1ViaDL(address indexed pairWNATIVE, address indexed pairB, address indexed sender, uint256 ethUsed, uint256 dlRequired, uint256 outBTarget, uint256 feeOutDL, uint256 feeInDL, uint256 dlRefund, uint256 ethRefund, address to);
 
     /* -------------- tiny structs（降栈） -------------- */
     struct QBuyNet   { uint256 gross; uint256 feeOut; uint256 in1Min; }
@@ -372,11 +378,75 @@ contract DealRouter is ReentrancyGuard {
         if (r.dlRefund > 0) IERC20(dl).safeTransfer(from, r.dlRefund);
     }
 
+    // ====== B exact-in -> ETH min-out（pairA=A/DL，pairWNATIVE=DL/WNATIVE） ====== //
+    function _execExact1ForETHViaDL(address pairA, address pairWNATIVE, address from, address to, uint256 amountAIn, uint256 minOutETH)
+        internal
+        returns (ResDouble memory r)
+    {
+        require(IDealPair(pairWNATIVE).token1() == WNATIVE, "PAIR_NOT_WNATIVE");
+        require(IDealPair(pairA).token0() == IDealPair(pairWNATIVE).token0(), "DL_MISMATCH");
+
+        // 跳1：A -> DL（Router 收 DL）
+        address tokenA = IDealPair(pairA).token1();
+        uint256 inA = _pullToPairAndGetIn(tokenA, pairA, from, amountAIn);
+        require(inA > 0, "NO_IN_A");
+        QBuyIn1 memory q1 = _qBuyIn1(pairA, inA);
+        IDealPair(pairA).swap(q1.gross, 0, address(this));
+        r.inAUsed    = inA;
+        r.dlNetOrReq = q1.out0Net;
+        r.feeOutDL   = q1.feeOut;
+
+        // 跳2：DL -> WNATIVE -> ETH（用户收 ETH）
+        QSellIn0 memory q2 = _qSellIn0(pairWNATIVE, r.dlNetOrReq);
+        require(q2.out1 >= minOutETH, "SLIPPAGE_ETH");
+        IERC20(IDealPair(pairA).token0()).safeTransfer(pairWNATIVE, r.dlNetOrReq);
+        IDealPair(pairWNATIVE).swap(0, q2.out1, address(this));
+        IWNative(WNATIVE).withdraw(q2.out1);
+        _sendETH(to, q2.out1);
+
+        r.outBOrETH = q2.out1;
+        r.feeInDL   = q2.feeIn;
+    }
+
+    // ====== ETH max-in -> B exact-out（pairWNATIVE=DL/WNATIVE，pairB=DL/B） ====== //
+    function _execETHForExact1ViaDL(address pairWNATIVE, address pairB, address from, address to, uint256 outBTarget, uint256 ethMax)
+        internal
+        returns (ResDouble memory r)
+    {
+        require(IDealPair(pairWNATIVE).token1() == WNATIVE, "PAIR_NOT_WNATIVE");
+        require(IDealPair(pairWNATIVE).token0() == IDealPair(pairB).token0(), "DL_MISMATCH");
+        require(ethMax > 0, "ZERO_ETH");
+
+        // 第二跳需求：为 outBTarget 需要的 DL
+        QSellOut1 memory s = _qSellOut1(pairB, outBTarget);
+        r.dlNetOrReq = s.in0Min; // required DL
+        r.feeInDL    = s.feeIn;
+
+        // 第一跳：ETH -> DL（只换入所需 ETH）
+        QBuyNet memory b = _qBuyNet(pairWNATIVE, r.dlNetOrReq);
+        require(b.in1Min <= ethMax, "ETH_NOT_ENOUGH");
+        _wrapToPair(pairWNATIVE, b.in1Min);
+        IDealPair(pairWNATIVE).swap(b.gross, 0, address(this));
+        r.inAUsed  = b.in1Min; // 实际用掉 ETH
+        r.feeOutDL = b.feeOut;
+
+        // 跳2：DL -> B（exact-out），退回多余 DL
+        address dl = IDealPair(pairB).token0();
+        uint256 dlBal = IERC20(dl).balanceOf(address(this));
+        require(dlBal >= r.dlNetOrReq, "DL_NOT_ENOUGH");
+        IERC20(dl).safeTransfer(pairB, r.dlNetOrReq);
+        IDealPair(pairB).swap(0, outBTarget, to);
+        r.outBOrETH = outBTarget;
+
+        r.dlRefund = dlBal - r.dlNetOrReq;
+        if (r.dlRefund > 0) IERC20(dl).safeTransfer(from, r.dlRefund);
+    }
+
     /* ===================================================== *
      *                EXTERNAL / EMIT ONLY                   *
      * ===================================================== */
 
-    // —— 单跳（ERC20） ——
+    // —— 单跳（ERC20） —— //
     function swapExact1For0(address pair, uint256 amount1In, uint256 minOut0Net, address to, uint256 deadline) external nonReentrant {
         _deadline(deadline); require(to != address(0), "ZERO_TO");
         ResSingle memory r = _execExact1For0(pair, amount1In, msg.sender, to, minOut0Net);
@@ -398,7 +468,7 @@ contract DealRouter is ReentrancyGuard {
         emit Swap0ForExact1(pair, msg.sender, r.inAmt, out1Target, r.feeSide, to);
     }
 
-    // —— 单跳（ETH/BNB via WNATIVE） ——
+    // —— 单跳（ETH/BNB via WNATIVE） —— //
     function swapExactETHFor0(address pair, uint256 minOut0Net, address to, uint256 deadline) external payable nonReentrant {
         _deadline(deadline); require(to != address(0), "ZERO_TO");
         uint256 ethIn = msg.value;
@@ -423,7 +493,7 @@ contract DealRouter is ReentrancyGuard {
         emit Swap0ForExactETH(pair, msg.sender, r.inAmt, outETHTarget, r.feeSide, to);
     }
 
-    // —— 双跳（A ↔ DL ↔ B，ERC20） ——
+    // —— 双跳（A ↔ DL ↔ B，ERC20） —— //
     function swapExact1For1ViaDL(address pairA, address pairB, uint256 amountAIn, uint256 minOutB, address to, uint256 deadline) external nonReentrant {
         _deadline(deadline); require(to != address(0), "ZERO_TO");
         ResDouble memory r = _execExact1For1ViaDL(pairA, pairB, msg.sender, to, amountAIn, minOutB);
@@ -435,7 +505,7 @@ contract DealRouter is ReentrancyGuard {
         emit Swap1ForExact1ViaDL(pairA, pairB, msg.sender, r.inAUsed, r.dlNetOrReq, outBTarget, r.feeOutDL, r.feeInDL, r.dlRefund, to);
     }
 
-    // —— 双跳便捷（ETH ↔ DL ↔ ERC20） ——
+    // —— 双跳便捷（ETH ↔ DL ↔ ERC20） —— //
     function swapExactETHFor1ViaDL(address pairWNATIVE, address pairB, uint256 minOutB, address to, uint256 deadline) external payable nonReentrant {
         _deadline(deadline); require(to != address(0), "ZERO_TO");
         uint256 ethIn = msg.value;
@@ -446,5 +516,21 @@ contract DealRouter is ReentrancyGuard {
         _deadline(deadline); require(to != address(0), "ZERO_TO");
         ResDouble memory r = _exec1ForExactETHViaDL(pairA, pairWNATIVE, msg.sender, to, outETHTarget, maxAmountAIn);
         emit Swap1ForExactETHViaDL(pairA, pairWNATIVE, msg.sender, r.inAUsed, r.dlNetOrReq, outETHTarget, r.feeOutDL, r.feeInDL, r.dlRefund, to);
+    }
+
+    // u（A） exact-in -> ETH min-out
+    function swapExact1ForETHViaDL(address pairA, address pairWNATIVE, uint256 amountAIn, uint256 minOutETH, address to, uint256 deadline) external nonReentrant {
+        _deadline(deadline); require(to != address(0), "ZERO_TO");
+        ResDouble memory r = _execExact1ForETHViaDL(pairA, pairWNATIVE, msg.sender, to, amountAIn, minOutETH);
+        emit SwapExact1ForETHViaDL(pairA, pairWNATIVE, msg.sender, r.inAUsed, r.dlNetOrReq, r.outBOrETH, r.feeOutDL, r.feeInDL, to);
+    }
+    // ETH max-in -> u exact-out（退回未用 ETH）
+    function swapETHForExact1ViaDL(address pairWNATIVE, address pairB, uint256 outBTarget, address to, uint256 deadline) external payable nonReentrant {
+        _deadline(deadline); require(to != address(0), "ZERO_TO");
+        uint256 ethMax = msg.value;
+        ResDouble memory r = _execETHForExact1ViaDL(pairWNATIVE, pairB, msg.sender, to, outBTarget, ethMax);
+        uint256 ethRefund = ethMax - r.inAUsed;
+        if (ethRefund > 0) _sendETH(msg.sender, ethRefund);
+        emit SwapETHForExact1ViaDL(pairWNATIVE, pairB, msg.sender, r.inAUsed, r.dlNetOrReq, outBTarget, r.feeOutDL, r.feeInDL, r.dlRefund, ethRefund, to);
     }
 }
