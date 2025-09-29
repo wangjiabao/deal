@@ -16,12 +16,15 @@ interface IFactoryIndex {
     function onParticipantRemoved(address prevParticipant) external;
     function onAbandoned(address creator, address prevParticipant) external;
     function onClosedFor(address user) external;
+
+    // 仅在 Completed 时写入 “完成热索引 ring”
+    function onCompletedFor(address user) external;
 }
 interface IFactoryInfo {
     function infoAddMinted(uint256 tokenId, uint256 amount) external;
     function infoSetMaxPartnerOf(uint256 tokenId, uint256 partnerTokenId) external;
 }
-/* 新增：通过 Factory 锁/解锁 InfoNFT（仅 Deal 可调） */
+/* 通过 Factory 锁/解锁 InfoNFT（仅 Deal 可调） */
 interface IFactoryLock {
     function infoLock(uint256 tokenId, address holder) external;
     function infoUnlock(uint256 tokenId) external;
@@ -380,7 +383,11 @@ contract Deal is Initializable, ReentrancyGuard {
         _sendOut(bMarginToken, b, bMarginAmount);
         emit Claimed(b, aSwapToken, aSwapNetForB, bMarginToken, bMarginAmount);
 
-        // 解锁 NFT + 清理热索引
+        // 仅当该侧开启过热索引追踪，才写入“完成热索引 ring”
+        if (_trackA)       { IFactoryIndex(factory).onCompletedFor(a); }
+        if (_trackBActive) { IFactoryIndex(factory).onCompletedFor(b); }
+
+        // 解锁 NFT + 清理“活跃热索引”
         _unlockNftIfLocked(true);
         _unlockNftIfLocked(false);
         if (_trackA)       { IFactoryIndex(factory).onClosedFor(a); _trackA = false; }

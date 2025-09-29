@@ -142,15 +142,27 @@ contract DealFactory is Ownable {
     event TrackedAdded(address indexed user, address indexed deal);
     event TrackedRemoved(address indexed user, address indexed deal);
 
-    /* ---------- 热索引 ---------- */
+    /* ---------- 热索引（活跃） ---------- */
     mapping(address => address[]) private _trackedDealsByUser;
     mapping(address => mapping(address => uint256)) private _trackedIndexByUser;
+
+    /* ---------- 完成热索引（每用户固定 10 个，环形缓冲） ---------- */
+    uint8 public constant COMPLETED_MAX = 10;
+
+    struct CompletedRing {
+        address[COMPLETED_MAX] items; // 以逻辑顺序铺放在环上
+        uint8 start;                  // 指向最旧元素的位置
+        uint8 size;                   // 当前数量
+    }
+    mapping(address => CompletedRing) private _completedByUser;
+    event CompletedAdded(address indexed user, address indexed deal);
 
     /* ---------------- Modifiers ---------------- */
     modifier onlyAdmin() {
         require(msg.sender == admin, "NOT_ADMIN");
         _;
     }
+    modifier onlyDeal() { require(isDeal[msg.sender]); _; }
 
     constructor(address _dealImpl, address _pairImpl, uint64 _minTimeoutSeconds) Ownable(msg.sender) {
         require(_dealImpl != address(0) && _pairImpl != address(0));
@@ -349,7 +361,6 @@ contract DealFactory is Ownable {
     }
 
     /* ========== 代理：增发 DL（仅 Deal） ========== */
-    modifier onlyDeal() { require(isDeal[msg.sender]); _; }
     function mintDL(address to, uint256 amount) external onlyDeal { require(to != address(0) && amount > 0); IDLMint(dlToken).mint(to, amount); emit DLMinted(to, amount, msg.sender); }
 
     /* ========== 代理：写 InfoNFT（仅 Deal） ========== */
@@ -379,7 +390,13 @@ contract DealFactory is Ownable {
     function onAbandoned(address creator, address prevParticipant) external onlyDeal { if (creator != address(0)) _removeTracked(creator, msg.sender); if (prevParticipant != address(0)) _removeTracked(prevParticipant, msg.sender); }
     function onClosedFor(address user) external onlyDeal { if (user != address(0)) _removeTracked(user, msg.sender); }
 
-    /* ========== 热索引只读 ========== */
+    // 完成回调（仅完成态 & 仅 Deal 可调）
+    function onCompletedFor(address user) external onlyDeal {
+        if (user == address(0)) return;
+        _addCompleted(user, msg.sender);
+    }
+
+    /* ========== 热索引只读（活跃） ========== */
     function trackedCount(address user) external view returns (uint256) { return _trackedDealsByUser[user].length; }
     function getTracked(address user, uint256 offset, uint256 limit) external view returns (address[] memory list) {
         address[] storage arr = _trackedDealsByUser[user]; uint256 len = arr.length;
@@ -389,6 +406,43 @@ contract DealFactory is Ownable {
     }
     function isTracked(address user, address deal) external view returns (bool) { return _trackedIndexByUser[user][deal] != 0; }
 
+    /* ========== 完成热索引只读 ========== */
+    function completedCount(address user) external view returns (uint256) {
+        return _completedByUser[user].size;
+    }
+
+    /**
+     * @param newestFirst true: newest->older；false: oldest->newer
+     */
+    function getCompleted(
+        address user,
+        uint256 offset,
+        uint256 limit,
+        bool newestFirst
+    ) external view returns (address[] memory list) {
+        CompletedRing storage r = _completedByUser[user];
+        uint256 sz = r.size;
+        if (offset >= sz) return new address[](0);
+        uint256 end = offset + limit;
+        if (end > sz) end = sz;
+        uint256 n = end - offset;
+
+        list = new address[](n);
+        if (newestFirst) {
+            for (uint256 i = 0; i < n; ++i) {
+                uint256 logical = sz - 1 - (offset + i);
+                uint8 idx = uint8((uint16(r.start) + uint16(logical)) % uint16(COMPLETED_MAX));
+                list[i] = r.items[idx];
+            }
+        } else {
+            for (uint256 i = 0; i < n; ++i) {
+                uint8 idx = uint8((uint16(r.start) + uint16(offset + i)) % uint16(COMPLETED_MAX));
+                list[i] = r.items[idx];
+            }
+        }
+    }
+
+    /* ---------- 辅助（活跃热索引） ---------- */
     function _addTracked(address user, address deal) internal {
         mapping(address => uint256) storage idx = _trackedIndexByUser[user];
         if (idx[deal] != 0) return;
@@ -405,6 +459,19 @@ contract DealFactory is Ownable {
         emit TrackedRemoved(user, deal);
     }
 
-    /* ---------- 辅助 ---------- */
+    /* ---------- 辅助（完成热索引） ---------- */
+    function _addCompleted(address user, address deal) internal {
+        CompletedRing storage r = _completedByUser[user];
+        if (r.size < COMPLETED_MAX) {
+            uint8 idx = uint8((uint16(r.start) + uint16(r.size)) % uint16(COMPLETED_MAX));
+            r.items[idx] = deal;
+            unchecked { r.size += 1; }
+        } else {
+            r.items[r.start] = deal;
+            r.start = uint8((r.start + 1) % uint16(COMPLETED_MAX));
+        }
+        emit CompletedAdded(user, deal);
+    }
+
     function _assertDlPair(address pair) internal view { require(pair != address(0) && IDealPairLight(pair).token0() == dlToken); }
 }
