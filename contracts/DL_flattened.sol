@@ -4703,12 +4703,11 @@ contract DCToken is ERC20, ERC20Burnable, ERC20Permit, ERC20Pausable, AccessCont
         ERC20Permit(name_) // EIP-2612 域名使用 token name
     {
         _grantRole(DEFAULT_ADMIN_ROLE, initialAdmin);
+        _grantRole(MINTER_ROLE, minterFirst_);
 
         if (initialSupply > 0) {
             _mint(initialAdmin, initialSupply);
         }
-
-        _grantRole(MINTER_ROLE, minterFirst_);
     }
 
     function mint(address to, uint256 amount) external onlyRole(MINTER_ROLE) {

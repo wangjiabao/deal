@@ -1134,11 +1134,9 @@ pragma solidity ^0.8.26;
 
 
 
-/* ---------------- Token interfaces ---------------- */
-interface IDLBurnFrom { function burnFrom(address account, uint256 amount) external; }
 interface IDLMint     { function mint(address to, uint256 amount) external; }
+interface IDLBurnFrom { function burnFrom(address account, uint256 amount) external; }
 
-/* ---------------- Deal initializer interface ---------------- */
 interface IDeal {
     struct InitParams {
         address aSwapToken;   uint256 aSwapAmount;

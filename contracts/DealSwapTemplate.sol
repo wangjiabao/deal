@@ -1,20 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-/// ===== Minimal IERC20 =====
 import "./interfaces/IERC20.sol";
-
-/// ===== DL must be burnable =====
-interface IDLBurnable is IERC20 { function burn(uint256 value) external; }
-
-/// ===== SafeTransfer =====
 import "./utils/SafeTransfer.sol";
-
-/// ===== Minimal ReentrancyGuard =====
 import "./utils/ReentrancyGuard.sol";
-
-/// ===== Initializable =====
 import "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+
+interface IDLBurnable is IERC20 { function burn(uint256 value) external; }
 
 contract DealSwapTemplate is Initializable, ReentrancyGuard {
     using SafeTransfer for IERC20;

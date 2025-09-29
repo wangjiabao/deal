@@ -309,20 +309,11 @@ abstract contract Initializable {
 
 pragma solidity ^0.8.26;
 
-/// ===== Minimal IERC20 =====
 
 
-/// ===== DL must be burnable =====
+
+
 interface IDLBurnable is IERC20 { function burn(uint256 value) external; }
-
-/// ===== SafeTransfer =====
-
-
-/// ===== Minimal ReentrancyGuard =====
-
-
-/// ===== Initializable =====
-
 
 contract DealSwapTemplate is Initializable, ReentrancyGuard {
     using SafeTransfer for IERC20;

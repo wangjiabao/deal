@@ -377,10 +377,12 @@ contract Deal is Initializable, ReentrancyGuard {
         // === 结算派发（完成态） ===
         _sendOut(bSwapToken, a, bSwapNetForA);
         _sendOut(aMarginToken, a, aMarginAmount);
+
         emit Claimed(a, bSwapToken, bSwapNetForA, aMarginToken, aMarginAmount);
 
         _sendOut(aSwapToken, b, aSwapNetForB);
         _sendOut(bMarginToken, b, bMarginAmount);
+
         emit Claimed(b, aSwapToken, aSwapNetForB, bMarginToken, bMarginAmount);
 
         // 仅当该侧开启过热索引追踪，才写入“完成热索引 ring”
@@ -414,6 +416,7 @@ contract Deal is Initializable, ReentrancyGuard {
 
         _unlockNftIfLocked(true);
         _unlockNftIfLocked(false);
+        
         if (_trackA)       { IFactoryIndex(factory).onClosedFor(a); _trackA = false; }
         if (_trackBActive) { IFactoryIndex(factory).onClosedFor(b); _trackBActive = false; }
 

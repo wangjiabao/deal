@@ -90,8 +90,8 @@ contract DealInfoNFT is ERC721, EIP712, ERC721Votes, Ownable {
         isFactory[f] = true;          // 主 Factory 默认授权
         emit FactoryAdded(f);
         admin = msg.sender;
-        pair = p;
         mintPriceDL = u;
+        pair = p;
     }
 
     // 设置/切换主 Factory（必须先授权）

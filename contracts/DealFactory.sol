@@ -7,11 +7,9 @@ import {IERC20}     from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20}  from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC721}    from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 
-/* ---------------- Token interfaces ---------------- */
-interface IDLBurnFrom { function burnFrom(address account, uint256 amount) external; }
 interface IDLMint     { function mint(address to, uint256 amount) external; }
+interface IDLBurnFrom { function burnFrom(address account, uint256 amount) external; }
 
-/* ---------------- Deal initializer interface ---------------- */
 interface IDeal {
     struct InitParams {
         address aSwapToken;   uint256 aSwapAmount;

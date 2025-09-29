@@ -1,18 +1,4 @@
 
-// File: deal/contracts/interfaces/IERC20.sol
-
-
-pragma solidity ^0.8.26;
-
-interface IERC20 {
-    function totalSupply() external view returns (uint256);
-    function balanceOf(address who) external view returns (uint256);
-    function allowance(address owner, address spender) external view returns (uint256);
-
-    function transfer(address to, uint256 value) external returns (bool);
-    function approve(address spender, uint256 value) external returns (bool);
-    function transferFrom(address from, address to, uint256 value) external returns (bool);
-}
 // File: deal/contracts/interfaces/IDealPair.sol
 
 
@@ -36,6 +22,20 @@ interface IDealPair {
         external view returns (uint256 in0Min, uint256 feeIn, uint256 /*in0EffMin*/);
 }
 
+// File: deal/contracts/interfaces/IERC20.sol
+
+
+pragma solidity ^0.8.26;
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address who) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    function transfer(address to, uint256 value) external returns (bool);
+    function approve(address spender, uint256 value) external returns (bool);
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+}
 // File: deal/contracts/utils/SafeTransfer.sol
 
 
@@ -189,13 +189,13 @@ contract DealRouter is ReentrancyGuard {
         IERC20(token).safeTransferFrom(from, pair, minAmount);
         require(_balanceOf(token, pair) - b >= minAmount, string(abi.encodePacked(err)));
     }
-    function _wrapToPair(address pair, uint256 ethAmount) internal {
-        IWNative(WNATIVE).deposit{value: ethAmount}();
-        IERC20(WNATIVE).safeTransfer(pair, ethAmount);
-    }
     function _sendETH(address to, uint256 amt) internal {
         (bool ok, ) = to.call{value: amt}("");
         require(ok, "ETH_SEND_FAIL");
+    }
+    function _wrapToPair(address pair, uint256 ethAmount) internal {
+        IWNative(WNATIVE).deposit{value: ethAmount}();
+        IERC20(WNATIVE).safeTransfer(pair, ethAmount);
     }
     function _deadline(uint256 d) internal view { require(block.timestamp <= d, "EXPIRED"); }
 

@@ -9,8 +9,8 @@ pragma solidity ^0.8.26;
   - 覆盖：单跳 / 双跳（A↔DL↔B）/ ETH 便捷双跳（四条路径已对称齐全）
 */
 
-import "./interfaces/IERC20.sol";
 import "./interfaces/IDealPair.sol";
+import "./interfaces/IERC20.sol";
 import "./utils/SafeTransfer.sol";
 import "./utils/ReentrancyGuard.sol";
 
@@ -100,13 +100,13 @@ contract DealRouter is ReentrancyGuard {
         IERC20(token).safeTransferFrom(from, pair, minAmount);
         require(_balanceOf(token, pair) - b >= minAmount, string(abi.encodePacked(err)));
     }
-    function _wrapToPair(address pair, uint256 ethAmount) internal {
-        IWNative(WNATIVE).deposit{value: ethAmount}();
-        IERC20(WNATIVE).safeTransfer(pair, ethAmount);
-    }
     function _sendETH(address to, uint256 amt) internal {
         (bool ok, ) = to.call{value: amt}("");
         require(ok, "ETH_SEND_FAIL");
+    }
+    function _wrapToPair(address pair, uint256 ethAmount) internal {
+        IWNative(WNATIVE).deposit{value: ethAmount}();
+        IERC20(WNATIVE).safeTransfer(pair, ethAmount);
     }
     function _deadline(uint256 d) internal view { require(block.timestamp <= d, "EXPIRED"); }
 
