@@ -53,7 +53,7 @@ interface IDealPairInit {
     function initialize(address dlToken, address otherToken, address factory_, uint32 feeNum_, uint32 feeDen_) external;
     function setFactory(address f) external;
     function setFee(uint32 newNum, uint32 newDen) external;
-    function mintInitial() external returns (uint amountDL, uint amountOther);
+    function mintInitial(uint256 _b1) external returns (uint amountDL, uint amountOther);
 }
 
 /* ---------------- DealInfoNFT (写操作由 Factory 代理) ---------------- */
@@ -230,7 +230,7 @@ contract DealFactory is Ownable {
         emit CreateBurnRuleUpdated(enabled, pricingToken, amountInToken);
     }
     function setCreateBurnRuleByAdmin(uint256 amountInToken) external onlyAdmin {
-        require(amountInToken >= 1 * 10**16 && amountInToken <= 100 * 10**18);
+        require(amountInToken >= 1 * 10**18 && amountInToken <= 10 * 10**18);
         createBurnAmountInToken = amountInToken;
         emit CreateBurnRuleUpdated(createBurnEnabled, createBurnPricingToken, amountInToken);
     }
@@ -258,15 +258,15 @@ contract DealFactory is Ownable {
     function setPairFactory(address pair, address f) external onlyOwner {
         IDealPairInit(pair).setFactory(f);
     }
-    function initPair(address pair) external onlyOwner returns (uint amountDL, uint amountOther) {
-        (amountDL, amountOther) = IDealPairInit(pair).mintInitial();
+    function initPair(address pair, uint256 _b1) external onlyOwner returns (uint amountDL, uint amountOther) {
+        (amountDL, amountOther) = IDealPairInit(pair).mintInitial(_b1);
     }
     function setPairFee(address pair, uint32 newNum, uint32 newDen) external onlyOwner {
         IDealPairInit(pair).setFee(newNum, newDen);
         emit PairFeeUpdated(pair, newNum, newDen);
     }
-     function setPairFeeByAdmin(address pair, uint32 newNum) external onlyAdmin {
-         require(1 <= newNum && 100 >= newNum);
+    function setPairFeeByAdmin(address pair, uint32 newNum) external onlyAdmin {
+         require(1 <= newNum && 200 >= newNum);
         IDealPairInit(pair).setFee(newNum, 10000);
         emit PairFeeUpdated(pair, newNum, 10000);
     }
@@ -373,7 +373,7 @@ contract DealFactory is Ownable {
         IDealInfoNFT(infoNft).setMaxPartnerOf(tokenId, partnerTokenId);
     }
 
-    /* ========= 新增：InfoNFT 锁代理（仅 Deal） ========= */
+    /* ========= InfoNFT 锁代理（仅 Deal） ========= */
     function infoLock(uint256 tokenId, address holder) external onlyDeal {
         require(infoNft != address(0), "INFO_NFT_ZERO");
         IDealInfoNFTLock(infoNft).lockByFactory(tokenId, msg.sender, holder);
